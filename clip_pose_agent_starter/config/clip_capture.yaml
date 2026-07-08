@@ -1,6 +1,7 @@
 clip_object_capture_session:
   ros__parameters:
-    image_topic: /oak/rgb/image_raw
+    image_topic: /oak/rgb/image_raw/compressed
+    image_compressed: true
     camera_info_topic: /oak/rgb/camera_info
     pointcloud_topic: /oak/rgbd/points
     output_root: ~/clip_pose_sessions

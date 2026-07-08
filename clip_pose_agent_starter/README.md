@@ -20,3 +20,16 @@ ros2 launch clip_pose_agent_starter mur620_clip_capture.launch.py
 ```
 
 The capture GUI writes RGB images, intrinsics, `T_base_camera`, and the clicked RGBD anchor to `~/clip_pose_sessions/<timestamp>/`.
+
+Convenience runner with build, source, launch, and logging:
+
+```bash
+./src/agentic_vision/clip_pose_agent_starter/scripts/run_clip_capture.sh
+```
+
+Override launch values with environment variables, for example:
+
+```bash
+IMAGE_TOPIC=/oak/rgb/image_raw IMAGE_COMPRESSED=false MOVE_ENABLED=true \
+  ./src/agentic_vision/clip_pose_agent_starter/scripts/run_clip_capture.sh
+```

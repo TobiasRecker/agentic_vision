@@ -18,6 +18,7 @@ def generate_launch_description():
             params_file,
             {
                 "image_topic": LaunchConfiguration("image_topic"),
+                "image_compressed": LaunchConfiguration("image_compressed"),
                 "camera_info_topic": LaunchConfiguration("camera_info_topic"),
                 "pointcloud_topic": LaunchConfiguration("pointcloud_topic"),
                 "output_root": LaunchConfiguration("output_root"),
@@ -48,7 +49,8 @@ def generate_launch_description():
                     ]
                 ),
             ),
-            DeclareLaunchArgument("image_topic", default_value="/oak/rgb/image_raw"),
+            DeclareLaunchArgument("image_topic", default_value="/oak/rgb/image_raw/compressed"),
+            DeclareLaunchArgument("image_compressed", default_value="true"),
             DeclareLaunchArgument("camera_info_topic", default_value="/oak/rgb/camera_info"),
             DeclareLaunchArgument("pointcloud_topic", default_value="/oak/rgbd/points"),
             DeclareLaunchArgument("output_root", default_value="~/clip_pose_sessions"),

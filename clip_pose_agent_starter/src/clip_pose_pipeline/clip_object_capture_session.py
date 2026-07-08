@@ -20,7 +20,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2
 from sensor_msgs_py import point_cloud2
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - lets non-robot dev shells import the m
 @dataclass
 class Observation:
     image: np.ndarray
-    image_msg: Image
+    image_msg: Image | CompressedImage
     camera_info: CameraInfo
     cloud_msg: PointCloud2 | None
     T_base_tcp: np.ndarray
@@ -58,7 +58,8 @@ class ClipObjectCaptureSession(Node):
     def __init__(self) -> None:
         super().__init__("clip_object_capture_session")
 
-        self.declare_parameter("image_topic", "/oak/rgb/image_raw")
+        self.declare_parameter("image_topic", "/oak/rgb/image_raw/compressed")
+        self.declare_parameter("image_compressed", True)
         self.declare_parameter("camera_info_topic", "/oak/rgb/camera_info")
         self.declare_parameter("pointcloud_topic", "/oak/rgbd/points")
         self.declare_parameter("output_root", "~/clip_pose_sessions")
@@ -110,10 +111,14 @@ class ClipObjectCaptureSession(Node):
 
         qos = QoSProfile(depth=1)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
-        self.latest_image_msg: Image | None = None
+        self.latest_image_msg: Image | CompressedImage | None = None
         self.latest_camera_info: CameraInfo | None = None
         self.latest_cloud_msg: PointCloud2 | None = None
-        self.create_subscription(Image, self.param_str("image_topic"), self.on_image, qos)
+        self.image_compressed = self.param_bool("image_compressed") or self.param_str("image_topic").endswith(
+            "/compressed"
+        )
+        image_msg_type = CompressedImage if self.image_compressed else Image
+        self.create_subscription(image_msg_type, self.param_str("image_topic"), self.on_image, qos)
         self.create_subscription(CameraInfo, self.param_str("camera_info_topic"), self.on_camera_info, qos)
         self.create_subscription(PointCloud2, self.param_str("pointcloud_topic"), self.on_cloud, qos)
 
@@ -179,7 +184,7 @@ class ClipObjectCaptureSession(Node):
             self.stop_jog(force=True)
             cv2.destroyWindow(self.window_name)
 
-    def on_image(self, msg: Image) -> None:
+    def on_image(self, msg: Image | CompressedImage) -> None:
         self.latest_image_msg = msg
 
     def on_camera_info(self, msg: CameraInfo) -> None:
@@ -195,7 +200,7 @@ class ClipObjectCaptureSession(Node):
             return view
 
         try:
-            image = self.bridge.imgmsg_to_cv2(self.latest_image_msg, desired_encoding="bgr8")
+            image = self.decode_image_msg(self.latest_image_msg)
         except Exception as exc:  # noqa: BLE001
             view = np.zeros((520, 960, 3), dtype=np.uint8)
             self.last_status = f"image decode failed: {exc}"
@@ -325,7 +330,7 @@ class ClipObjectCaptureSession(Node):
             return None
 
         try:
-            image = self.bridge.imgmsg_to_cv2(self.latest_image_msg, desired_encoding="bgr8")
+            image = self.decode_image_msg(self.latest_image_msg)
         except Exception as exc:  # noqa: BLE001
             self.last_status = f"image decode failed: {exc}"
             return None
@@ -833,6 +838,7 @@ class ClipObjectCaptureSession(Node):
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "topics": {
                 "image": self.param_str("image_topic"),
+                "image_compressed": self.image_compressed,
                 "camera_info": self.param_str("camera_info_topic"),
                 "pointcloud": self.param_str("pointcloud_topic"),
             },
@@ -888,6 +894,11 @@ class ClipObjectCaptureSession(Node):
             return image.copy(), 1.0
         resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         return resized, scale
+
+    def decode_image_msg(self, msg: Image | CompressedImage) -> np.ndarray:
+        if isinstance(msg, CompressedImage):
+            return self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        return self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
 
     def draw_text_lines(self, image: np.ndarray, lines: list[str]) -> None:
         y = 28
