@@ -143,6 +143,10 @@ class ClipObjectCaptureSession(Node):
         self.display_scale = 1.0
         self.last_status = "waiting for ROS data"
         self._last_reported_status = ""
+        self._last_data_wait_report = 0.0
+        self._reported_first_image = False
+        self._reported_first_camera_info = False
+        self._reported_first_cloud = False
         self.last_tf_error = ""
         self.rotation_jog_mode = False
         self.last_key_text = "none"
@@ -293,15 +297,34 @@ class ClipObjectCaptureSession(Node):
 
     def on_image(self, msg: Image | CompressedImage) -> None:
         self.latest_image_msg = msg
+        if not self._reported_first_image:
+            self._reported_first_image = True
+            self.get_logger().info(
+                f"Received first image on {self.param_str('image_topic')} "
+                f"frame='{msg.header.frame_id}' stamp={stamp_float(msg.header.stamp):.3f}"
+            )
 
     def on_camera_info(self, msg: CameraInfo) -> None:
         self.latest_camera_info = msg
+        if not self._reported_first_camera_info:
+            self._reported_first_camera_info = True
+            self.get_logger().info(
+                f"Received first CameraInfo on {self.param_str('camera_info_topic')} "
+                f"{msg.width}x{msg.height} frame='{msg.header.frame_id}'"
+            )
 
     def on_cloud(self, msg: PointCloud2) -> None:
         self.latest_cloud_msg = msg
+        if not self._reported_first_cloud:
+            self._reported_first_cloud = True
+            self.get_logger().info(
+                f"Received first PointCloud2 on {self.param_str('pointcloud_topic')} "
+                f"{msg.width}x{msg.height} frame='{msg.header.frame_id}'"
+            )
 
     def render_gui_frame(self) -> np.ndarray:
         if self.latest_image_msg is None:
+            self.report_missing_image_publishers()
             view = np.zeros((520, 960, 3), dtype=np.uint8)
             self.draw_text_lines(view, ["Waiting for OAK RGB image", self.last_status])
             return view
@@ -324,6 +347,21 @@ class ClipObjectCaptureSession(Node):
         status = self.status_lines(image.shape[:2])
         self.draw_text_lines(view, status)
         return view
+
+    def report_missing_image_publishers(self) -> None:
+        now = time.monotonic()
+        if now - self._last_data_wait_report < 2.0:
+            return
+        self._last_data_wait_report = now
+        image_topic = self.param_str("image_topic")
+        info_topic = self.param_str("camera_info_topic")
+        image_publishers = self.count_publishers(image_topic)
+        info_publishers = self.count_publishers(info_topic)
+        self.report_status(
+            f"waiting for image on {image_topic}; "
+            f"image_publishers={image_publishers}, camera_info_publishers={info_publishers}",
+            "warn",
+        )
 
     def status_lines(self, image_shape: tuple[int, int]) -> list[str]:
         anchor_text = "anchor: none"

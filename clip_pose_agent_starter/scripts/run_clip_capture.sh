@@ -32,6 +32,8 @@ JOG_FRAME="${JOG_FRAME:-UR10_r/base_link}"
 SAMPLES="${SAMPLES:-18}"
 ALLOW_2D_CENTER_FALLBACK="${ALLOW_2D_CENTER_FALLBACK:-true}"
 FALLBACK_CENTER_DEPTH_M="${FALLBACK_CENTER_DEPTH_M:-0.45}"
+WAIT_FOR_CAMERA_SEC="${WAIT_FOR_CAMERA_SEC:-12}"
+REQUIRE_POINTCLOUD="${REQUIRE_POINTCLOUD:-false}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_ROOT="${CLIP_CAPTURE_LOG_DIR:-${OUTPUT_ROOT}/node_logs}"
@@ -58,7 +60,67 @@ echo "[clip_capture] extra S-TF:${EXTRA_TF_STATIC_TOPICS}"
 echo "[clip_capture] handeye:  configured=${USE_CONFIGURED_TCP_TO_CAMERA}"
 echo "[clip_capture] handeye t:${TCP_TO_CAMERA_TRANSLATION_XYZ}"
 echo "[clip_capture] handeye q:${TCP_TO_CAMERA_QUATERNION_XYZW}"
+echo "[clip_capture] wait cam: ${WAIT_FOR_CAMERA_SEC}s; require pointcloud=${REQUIRE_POINTCLOUD}"
 echo
+
+topic_publisher_count() {
+  local topic="$1"
+  local topic_info
+  topic_info="$(ros2 topic info "${topic}" 2>/dev/null || true)"
+  printf '%s\n' "${topic_info}" | awk '/Publisher count:/ {print $3; found=1} END {if (!found) print 0}'
+}
+
+topic_type_or_empty() {
+  local topic="$1"
+  ros2 topic type "${topic}" 2>/dev/null || true
+}
+
+topic_has_publisher() {
+  local topic="$1"
+  local count
+  count="$(topic_publisher_count "${topic}")"
+  [[ "${count}" =~ ^[1-9][0-9]*$ ]]
+}
+
+wait_for_camera_publishers() {
+  local required_topics=("${IMAGE_TOPIC}" "${CAMERA_INFO_TOPIC}")
+  if [[ "${REQUIRE_POINTCLOUD}" == "true" ]]; then
+    required_topics+=("${POINTCLOUD_TOPIC}")
+  fi
+  if [[ "${WAIT_FOR_CAMERA_SEC}" == "0" ]]; then
+    return
+  fi
+
+  echo
+  echo "[clip_capture] waiting for camera publishers..."
+  local start now missing topic count topic_type
+  start="$(date +%s)"
+  while true; do
+    missing=()
+    for topic in "${required_topics[@]}"; do
+      count="$(topic_publisher_count "${topic}")"
+      topic_type="$(topic_type_or_empty "${topic}")"
+      if [[ ! "${count}" =~ ^[1-9][0-9]*$ ]]; then
+        missing+=("${topic}{type=${topic_type:-none},pubs=${count:-0}}")
+      fi
+    done
+    if [[ "${#missing[@]}" -eq 0 ]]; then
+      echo "[clip_capture] camera publishers are visible."
+      return
+    fi
+    now="$(date +%s)"
+    if (( now - start >= WAIT_FOR_CAMERA_SEC )); then
+      echo "[clip_capture] WARNING: camera publishers still missing after ${WAIT_FOR_CAMERA_SEC}s: ${missing[*]}"
+      for topic in "${required_topics[@]}"; do
+        echo "[clip_capture] topic info -v ${topic}:"
+        timeout 3 ros2 topic info -v "${topic}" 2>/dev/null || true
+      done
+      return
+    fi
+    echo "[clip_capture] waiting: ${missing[*]}"
+    sleep 1
+  done
+}
 
 cd "${WS_DIR}"
 echo "[clip_capture] building ${PACKAGE}..."
@@ -80,9 +142,12 @@ ros2 topic list 2>/dev/null | grep -E '(^/oak|jparse|tf)' || true
 for topic in "${IMAGE_TOPIC}" "${CAMERA_INFO_TOPIC}" "${POINTCLOUD_TOPIC}" \
   ${EXTRA_TF_TOPICS//,/ } ${EXTRA_TF_STATIC_TOPICS//,/ }; do
   [[ -n "${topic}" ]] || continue
-  topic_type="$(ros2 topic type "${topic}" 2>/dev/null || true)"
-  echo "[clip_capture] topic type ${topic}: ${topic_type:-<not visible>}"
+  topic_type="$(topic_type_or_empty "${topic}")"
+  publisher_count="$(topic_publisher_count "${topic}")"
+  echo "[clip_capture] topic ${topic}: type=${topic_type:-<not visible>} publishers=${publisher_count}"
 done
+
+wait_for_camera_publishers
 
 echo
 echo "[clip_capture] currently visible relevant actions:"
