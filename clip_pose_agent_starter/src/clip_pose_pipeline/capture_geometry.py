@@ -230,6 +230,43 @@ def center_camera_target(
     return T_target
 
 
+def camera_point_from_pixel(
+    pixel_uv: tuple[float, float] | list[float] | np.ndarray,
+    K: np.ndarray,
+    depth_m: float,
+) -> np.ndarray:
+    u, v = np.asarray(pixel_uv, dtype=np.float64).reshape(2)
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
+    if abs(fx) <= 1.0e-12 or abs(fy) <= 1.0e-12:
+        raise ValueError("Camera matrix has invalid focal length")
+    z = float(depth_m)
+    return np.array([(u - cx) * z / fx, (v - cy) * z / fy, z], dtype=np.float64)
+
+
+def center_camera_target_from_pixel(
+    T_base_camera_current: np.ndarray,
+    pixel_uv: tuple[float, float] | list[float] | np.ndarray,
+    K: np.ndarray,
+    depth_m: float,
+    xy_only: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    T_base_camera_current = np.asarray(T_base_camera_current, dtype=np.float64)
+    point_camera = camera_point_from_pixel(pixel_uv, K, depth_m)
+    anchor_base = transform_point(T_base_camera_current, point_camera)
+    lateral_camera = point_camera.copy()
+    lateral_camera[2] = 0.0
+    target_position = T_base_camera_current[:3, 3] + T_base_camera_current[:3, :3] @ lateral_camera
+    if xy_only:
+        target_position[2] = T_base_camera_current[2, 3]
+    T_target = T_base_camera_current.copy()
+    T_target[:3, 3] = target_position
+    return T_target, anchor_base
+
+
 def camera_forward_vector(T_base_camera: np.ndarray, look_axis: str = "plus_z") -> np.ndarray:
     z_axis = normalize(np.asarray(T_base_camera, dtype=np.float64)[:3, 2])
     return -z_axis if str(look_axis).lower() == "minus_z" else z_axis

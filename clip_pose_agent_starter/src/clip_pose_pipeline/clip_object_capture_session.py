@@ -18,13 +18,15 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2
 from sensor_msgs_py import point_cloud2
+from tf2_msgs.msg import TFMessage
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from .capture_geometry import (
+    center_camera_target_from_pixel,
     center_camera_target,
     estimate_anchor_from_xyz_image,
     generate_spiral_hemisphere_targets,
@@ -68,6 +70,8 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("robot_base_frame", "mur620/UR10_r/base_link")
         self.declare_parameter("robot_tcp_frame", "mur620/UR10_r/tool0")
         self.declare_parameter("camera_frame", "")
+        self.declare_parameter("extra_tf_topics", "")
+        self.declare_parameter("extra_tf_static_topics", "")
         self.declare_parameter("planning_frame", "mur620/UR10_r/base_link")
         self.declare_parameter("action_name", "/mur620/jparse_move_r")
         self.declare_parameter("move_enabled", False)
@@ -83,6 +87,8 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("click_window_radius", 4)
         self.declare_parameter("click_min_points", 8)
         self.declare_parameter("click_max_mad_m", 0.02)
+        self.declare_parameter("allow_2d_center_fallback", True)
+        self.declare_parameter("fallback_center_depth_m", 0.45)
         self.declare_parameter("samples", 18)
         self.declare_parameter("sphere_radius_m", 0.0)
         self.declare_parameter("sphere_polar_span_deg", 50.0)
@@ -121,6 +127,8 @@ class ClipObjectCaptureSession(Node):
         self.create_subscription(image_msg_type, self.param_str("image_topic"), self.on_image, qos)
         self.create_subscription(CameraInfo, self.param_str("camera_info_topic"), self.on_camera_info, qos)
         self.create_subscription(PointCloud2, self.param_str("pointcloud_topic"), self.on_cloud, qos)
+        self._extra_tf_seen: set[str] = set()
+        self.extra_tf_subs = self.create_extra_tf_subscriptions()
 
         session_name = self.param_str("session_name") or datetime.now().strftime("%Y%m%d_%H%M%S")
         output_root = Path(os.path.expanduser(self.param_str("output_root")))
@@ -131,6 +139,7 @@ class ClipObjectCaptureSession(Node):
         self.window_name = "clip_object_capture_session"
         self.display_scale = 1.0
         self.last_status = "waiting for ROS data"
+        self._last_reported_status = ""
         self.last_tf_error = ""
         self.rotation_jog_mode = False
         self.last_key_text = "none"
@@ -143,8 +152,10 @@ class ClipObjectCaptureSession(Node):
         self.last_jog_update_time = time.monotonic()
 
         self.initial_T_base_tcp: np.ndarray | None = None
+        self.clicked_pixel_uv: list[float] | None = None
         self.anchor: dict[str, Any] | None = None
         self.gui_target: np.ndarray | None = None
+        self.gui_target_anchor_base: np.ndarray | None = None
         self.gui_target_source = ""
         self.target_cache: list[np.ndarray] = []
         self.target_cursor = 0
@@ -168,6 +179,66 @@ class ClipObjectCaptureSession(Node):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
+
+    def param_str_list(self, name: str) -> list[str]:
+        value = self.get_parameter(name).value
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return [item.strip() for item in str(value).split(",") if item.strip()]
+
+    def report_status(self, message: str, level: str = "info") -> None:
+        self.last_status = message
+        if message == self._last_reported_status:
+            return
+        self._last_reported_status = message
+        if level == "error":
+            self.get_logger().error(message)
+        elif level == "warn":
+            self.get_logger().warn(message)
+        else:
+            self.get_logger().info(message)
+
+    def create_extra_tf_subscriptions(self) -> list[Any]:
+        subscriptions: list[Any] = []
+        tf_qos = QoSProfile(depth=100)
+        tf_qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        tf_static_qos = QoSProfile(depth=100)
+        tf_static_qos.reliability = ReliabilityPolicy.RELIABLE
+        tf_static_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
+        for topic in self.param_str_list("extra_tf_topics"):
+            subscriptions.append(
+                self.create_subscription(
+                    TFMessage,
+                    topic,
+                    lambda msg, topic=topic: self.on_extra_tf(msg, topic, is_static=False),
+                    tf_qos,
+                )
+            )
+            self.get_logger().info(f"Listening for extra TF on {topic}")
+        for topic in self.param_str_list("extra_tf_static_topics"):
+            subscriptions.append(
+                self.create_subscription(
+                    TFMessage,
+                    topic,
+                    lambda msg, topic=topic: self.on_extra_tf(msg, topic, is_static=True),
+                    tf_static_qos,
+                )
+            )
+            self.get_logger().info(f"Listening for extra static TF on {topic}")
+        return subscriptions
+
+    def on_extra_tf(self, msg: TFMessage, topic: str, is_static: bool) -> None:
+        authority = f"extra_tf:{topic}"
+        for transform in msg.transforms:
+            if is_static:
+                self.tf_buffer.set_transform_static(transform, authority)
+            else:
+                self.tf_buffer.set_transform(transform, authority)
+        if msg.transforms and topic not in self._extra_tf_seen:
+            self._extra_tf_seen.add(topic)
+            kind = "static TF" if is_static else "TF"
+            self.get_logger().info(f"Ingested {len(msg.transforms)} {kind} transforms from {topic}")
 
     def run_gui_session(self) -> None:
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
@@ -227,6 +298,8 @@ class ClipObjectCaptureSession(Node):
                 f"anchor base [{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}] "
                 f"mad={q['median_abs_deviation_m'] * 1000.0:.1f}mm"
             )
+        elif self.clicked_pixel_uv is not None:
+            anchor_text = f"2D click px [{self.clicked_pixel_uv[0]:.0f}, {self.clicked_pixel_uv[1]:.0f}]"
         cloud_text = "cloud: no"
         if self.latest_cloud_msg is not None:
             cloud_text = f"cloud: {self.latest_cloud_msg.width}x{self.latest_cloud_msg.height}"
@@ -243,7 +316,7 @@ class ClipObjectCaptureSession(Node):
                 f"mode={'rot' if self.rotation_jog_mode else 'xyz'}"
             ),
             f"last key: {self.last_key_text}  {self.last_jog_text}",
-            "click anchor | z center | n next | g go | c save | b back | . stop | q quit",
+            "click anchor | z prepare center | g go (needs move on) | n next | c save | . stop | q quit",
         ]
 
     def on_mouse(self, event: int, x: int, y: int, _flags: int, _param: Any) -> None:
@@ -255,27 +328,36 @@ class ClipObjectCaptureSession(Node):
         self.set_anchor_from_click(pixel)
 
     def set_anchor_from_click(self, pixel_uv: tuple[float, float]) -> None:
-        observation = self.current_observation(require_cloud=True)
+        self.clicked_pixel_uv = [float(pixel_uv[0]), float(pixel_uv[1])]
+        self.get_logger().info(f"Click received at pixel [{pixel_uv[0]:.1f}, {pixel_uv[1]:.1f}]")
+        observation = self.current_observation(require_cloud=False)
         if observation is None:
+            return
+        if self.latest_cloud_msg is None:
+            self.report_status(
+                "2D click stored; no PointCloud2 yet. "
+                "z can prepare approximate center target using fallback depth.",
+                "warn",
+            )
             return
         xyz = self.pointcloud_xyz_image(observation.cloud_msg)
         if xyz is None:
             return
         cloud_frame = observation.cloud_msg.header.frame_id if observation.cloud_msg is not None else ""
         if cloud_frame and cloud_frame != observation.camera_frame:
-            self.last_status = (
+            self.report_status(
                 f"blocked: pointcloud frame '{cloud_frame}' differs from camera frame "
-                f"'{observation.camera_frame}'"
+                f"'{observation.camera_frame}'",
+                "warn",
             )
-            self.get_logger().warn(self.last_status)
             return
         image_h, image_w = observation.image.shape[:2]
         cloud_h, cloud_w = xyz.shape[:2]
         if (image_w, image_h) != (cloud_w, cloud_h):
-            self.last_status = (
-                f"blocked: image {image_w}x{image_h} and pointcloud {cloud_w}x{cloud_h} differ"
+            self.report_status(
+                f"blocked: image {image_w}x{image_h} and pointcloud {cloud_w}x{cloud_h} differ",
+                "warn",
             )
-            self.get_logger().warn(self.last_status)
             return
 
         estimate = estimate_anchor_from_xyz_image(
@@ -286,8 +368,7 @@ class ClipObjectCaptureSession(Node):
             max_mad_m=float(self.get_parameter("click_max_mad_m").value),
         )
         if not estimate.valid or estimate.point_camera is None:
-            self.last_status = f"anchor rejected: {estimate.reason}"
-            self.get_logger().warn(f"{self.last_status}; quality={estimate.as_dict()}")
+            self.report_status(f"anchor rejected: {estimate.reason}; quality={estimate.as_dict()}", "warn")
             return
 
         p_base_anchor = transform_point(observation.T_base_camera, estimate.point_camera)
@@ -304,15 +385,16 @@ class ClipObjectCaptureSession(Node):
             "cloud_stamp": stamp_dict(observation.cloud_msg.header.stamp) if observation.cloud_msg is not None else None,
             "T_base_camera_at_click": matrix_to_list(observation.T_base_camera),
         }
+        self.clicked_pixel_uv = [float(pixel_uv[0]), float(pixel_uv[1])]
         self.target_cache = []
         self.target_cursor = 0
         self.gui_target = None
         self.gui_target_source = ""
-        self.last_status = (
+        self.report_status(
             "anchor set: "
-            f"base=[{p_base_anchor[0]:.3f}, {p_base_anchor[1]:.3f}, {p_base_anchor[2]:.3f}]"
+            f"base=[{p_base_anchor[0]:.3f}, {p_base_anchor[1]:.3f}, {p_base_anchor[2]:.3f}]",
+            "info",
         )
-        self.get_logger().info(self.last_status)
         self.write_anchors()
         self.write_metadata()
         if self.param_bool("save_anchor_approx_tf"):
@@ -320,19 +402,19 @@ class ClipObjectCaptureSession(Node):
 
     def current_observation(self, require_cloud: bool = False) -> Observation | None:
         if self.latest_image_msg is None:
-            self.last_status = f"waiting for image on {self.param_str('image_topic')}"
+            self.report_status(f"waiting for image on {self.param_str('image_topic')}", "warn")
             return None
         if self.latest_camera_info is None:
-            self.last_status = f"waiting for CameraInfo on {self.param_str('camera_info_topic')}"
+            self.report_status(f"waiting for CameraInfo on {self.param_str('camera_info_topic')}", "warn")
             return None
         if require_cloud and self.latest_cloud_msg is None:
-            self.last_status = f"waiting for PointCloud2 on {self.param_str('pointcloud_topic')}"
+            self.report_status(f"waiting for PointCloud2 on {self.param_str('pointcloud_topic')}", "warn")
             return None
 
         try:
             image = self.decode_image_msg(self.latest_image_msg)
         except Exception as exc:  # noqa: BLE001
-            self.last_status = f"image decode failed: {exc}"
+            self.report_status(f"image decode failed: {exc}", "warn")
             return None
 
         camera_frame = self.param_str("camera_frame")
@@ -341,7 +423,7 @@ class ClipObjectCaptureSession(Node):
         if not camera_frame and self.latest_cloud_msg is not None:
             camera_frame = self.latest_cloud_msg.header.frame_id
         if not camera_frame:
-            self.last_status = "waiting for camera frame id"
+            self.report_status("waiting for camera frame id", "warn")
             return None
 
         T_base_tcp = self.lookup_transform_matrix(self.param_str("robot_base_frame"), self.param_str("robot_tcp_frame"))
@@ -381,7 +463,7 @@ class ClipObjectCaptureSession(Node):
             )
         except TransformException as exc:
             self.last_tf_error = str(exc)
-            self.last_status = f"waiting for TF {target_frame}->{source_frame}: {exc}"
+            self.report_status(f"waiting for TF {target_frame}->{source_frame}: {exc}", "warn")
             return None
         translation = transform.transform.translation
         rotation = transform.transform.rotation
@@ -392,11 +474,10 @@ class ClipObjectCaptureSession(Node):
 
     def pointcloud_xyz_image(self, cloud_msg: PointCloud2 | None) -> np.ndarray | None:
         if cloud_msg is None:
-            self.last_status = f"waiting for PointCloud2 on {self.param_str('pointcloud_topic')}"
+            self.report_status(f"waiting for PointCloud2 on {self.param_str('pointcloud_topic')}", "warn")
             return None
         if cloud_msg.height <= 1:
-            self.last_status = "blocked: PointCloud2 is not organized"
-            self.get_logger().warn(self.last_status)
+            self.report_status("blocked: PointCloud2 is not organized", "warn")
             return None
         try:
             points = point_cloud2.read_points_numpy(
@@ -406,8 +487,7 @@ class ClipObjectCaptureSession(Node):
                 reshape_organized_cloud=True,
             )
         except Exception as exc:  # noqa: BLE001
-            self.last_status = f"pointcloud decode failed: {exc}"
-            self.get_logger().warn(self.last_status)
+            self.report_status(f"pointcloud decode failed: {exc}", "warn")
             return None
         arr = np.asarray(points)
         if arr.dtype.fields:
@@ -416,8 +496,7 @@ class ClipObjectCaptureSession(Node):
             try:
                 arr = arr.reshape(int(cloud_msg.height), int(cloud_msg.width), -1)
             except ValueError:
-                self.last_status = f"pointcloud has unexpected shape {arr.shape}"
-                self.get_logger().warn(self.last_status)
+                self.report_status(f"pointcloud has unexpected shape {arr.shape}", "warn")
                 return None
         return np.asarray(arr[:, :, :3], dtype=np.float64)
 
@@ -433,11 +512,13 @@ class ClipObjectCaptureSession(Node):
         if char == "." or char == " ":
             self.stop_jog(force=True)
             self.gui_target = None
+            self.gui_target_anchor_base = None
             self.gui_target_source = ""
+            self.report_status("stop requested; target cleared", "info")
             return True
         if char == "m":
             self.rotation_jog_mode = not self.rotation_jog_mode
-            self.last_status = f"jog mode {'rotation' if self.rotation_jog_mode else 'translation'}"
+            self.report_status(f"jog mode {'rotation' if self.rotation_jog_mode else 'translation'}", "info")
             return True
         if char == "z":
             self.prepare_center_target()
@@ -461,25 +542,40 @@ class ClipObjectCaptureSession(Node):
         return True
 
     def prepare_center_target(self) -> None:
-        if self.anchor is None:
-            self.last_status = "center blocked: click an anchor first"
+        if self.anchor is None and self.clicked_pixel_uv is None:
+            self.report_status("center blocked: click an anchor first", "warn")
             return
         observation = self.current_observation(require_cloud=False)
         if observation is None:
             return
-        anchor_base = np.asarray(self.anchor["p_base_anchor"], dtype=np.float64)
-        T_base_camera_target = center_camera_target(
-            observation.T_base_camera,
-            anchor_base,
-            xy_only=self.param_bool("center_camera_xy_only"),
-            look_axis=self.param_str("camera_look_axis"),
-        )
+        if self.anchor is not None:
+            anchor_base = np.asarray(self.anchor["p_base_anchor"], dtype=np.float64)
+            T_base_camera_target = center_camera_target(
+                observation.T_base_camera,
+                anchor_base,
+                xy_only=self.param_bool("center_camera_xy_only"),
+                look_axis=self.param_str("camera_look_axis"),
+            )
+            source = "center_3d_anchor"
+        elif self.param_bool("allow_2d_center_fallback"):
+            K = np.asarray(observation.camera_info.k, dtype=np.float64).reshape(3, 3)
+            T_base_camera_target, anchor_base = center_camera_target_from_pixel(
+                observation.T_base_camera,
+                self.clicked_pixel_uv,
+                K,
+                float(self.get_parameter("fallback_center_depth_m").value),
+                xy_only=self.param_bool("center_camera_xy_only"),
+            )
+            source = "center_2d_fallback"
+        else:
+            self.report_status("center blocked: no 3D anchor and 2D fallback disabled", "warn")
+            return
         T_base_tcp_target = T_base_camera_target @ invert_transform(observation.T_tcp_camera)
-        self.set_gui_target("center", T_base_tcp_target, observation)
+        self.set_gui_target(source, T_base_tcp_target, observation, anchor_base_override=anchor_base)
 
     def propose_next_target(self) -> None:
         if self.anchor is None:
-            self.last_status = "target blocked: click an anchor first"
+            self.report_status("target blocked: click an anchor first", "warn")
             return
         observation = self.current_observation(require_cloud=False)
         if observation is None:
@@ -516,14 +612,24 @@ class ClipObjectCaptureSession(Node):
             self.set_gui_target(f"sphere {self.target_cursor}/{len(self.target_cache)}", T_base_tcp_target, observation)
             return
 
-        self.last_status = "no safe target left; press n again to regenerate from current pose"
+        self.report_status("no safe target left; press n again to regenerate from current pose", "warn")
         self.target_cache = []
         self.target_cursor = 0
 
-    def set_gui_target(self, source: str, T_base_tcp_target: np.ndarray, observation: Observation) -> None:
-        if self.anchor is None:
+    def set_gui_target(
+        self,
+        source: str,
+        T_base_tcp_target: np.ndarray,
+        observation: Observation,
+        anchor_base_override: np.ndarray | None = None,
+    ) -> None:
+        if self.anchor is None and anchor_base_override is None:
             return
-        anchor_base = np.asarray(self.anchor["p_base_anchor"], dtype=np.float64)
+        anchor_base = (
+            np.asarray(anchor_base_override, dtype=np.float64)
+            if anchor_base_override is not None
+            else np.asarray(self.anchor["p_base_anchor"], dtype=np.float64)
+        )
         metrics = target_motion_metrics(
             observation.T_base_tcp,
             T_base_tcp_target,
@@ -534,21 +640,25 @@ class ClipObjectCaptureSession(Node):
         if not self.target_is_safe(metrics):
             return
         self.gui_target = T_base_tcp_target.copy()
+        self.gui_target_anchor_base = anchor_base.copy()
         self.gui_target_source = source
         self.target_history.append(
             {
                 "event": "target_prepared",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "source": source,
+                "anchor_source": "override" if anchor_base_override is not None else "rgbd_anchor",
                 "T_base_tcp": matrix_to_list(T_base_tcp_target),
                 "metrics": metrics_to_json(metrics),
             }
         )
-        self.last_status = (
+        motion_hint = "press g to move" if self.param_bool("move_enabled") else "set MOVE_ENABLED=true, then press g"
+        self.report_status(
             f"target {source}: tcp {metrics['tcp_delta_norm']:.3f}m, "
-            f"cam {metrics['camera_delta_norm']:.3f}m, rot {metrics['tcp_rotation_deg']:.1f}deg"
+            f"cam {metrics['camera_delta_norm']:.3f}m, rot {metrics['tcp_rotation_deg']:.1f}deg; "
+            f"{motion_hint}",
+            "info",
         )
-        self.get_logger().info(self.last_status)
         self.write_metadata()
 
     def target_is_safe(self, metrics: dict[str, Any]) -> bool:
@@ -560,32 +670,31 @@ class ClipObjectCaptureSession(Node):
             or metrics["camera_delta_norm"] > max_camera
             or metrics["tcp_rotation_deg"] > max_rotation
         ):
-            self.last_status = (
+            self.report_status(
                 f"target refused: tcp {metrics['tcp_delta_norm']:.3f}/{max_tcp:.3f}m, "
                 f"cam {metrics['camera_delta_norm']:.3f}/{max_camera:.3f}m, "
-                f"rot {metrics['tcp_rotation_deg']:.1f}/{max_rotation:.1f}deg"
+                f"rot {metrics['tcp_rotation_deg']:.1f}/{max_rotation:.1f}deg",
+                "warn",
             )
-            self.get_logger().warn(self.last_status)
             return False
         return True
 
     def go_to_gui_target(self) -> None:
         if self.gui_target is None:
-            self.last_status = "go blocked: no target prepared"
+            self.report_status("go blocked: no target prepared", "warn")
             return
         if not self.param_bool("move_enabled"):
-            self.last_status = "go blocked: move_enabled is false"
-            self.get_logger().warn(self.last_status)
+            self.report_status("go blocked: move_enabled is false", "warn")
             return
         observation = self.current_observation(require_cloud=False)
         if observation is None:
             return
-        if self.anchor is not None:
+        if self.gui_target_anchor_base is not None:
             metrics = target_motion_metrics(
                 observation.T_base_tcp,
                 self.gui_target,
                 observation.T_tcp_camera,
-                np.asarray(self.anchor["p_base_anchor"], dtype=np.float64),
+                self.gui_target_anchor_base,
                 look_axis=self.param_str("camera_look_axis"),
             )
             if not self.target_is_safe(metrics):
@@ -600,23 +709,23 @@ class ClipObjectCaptureSession(Node):
                 "success": bool(success),
             }
         )
-        self.last_status = "target move done" if success else "target move failed"
+        self.report_status("target move done" if success else "target move failed", "info" if success else "warn")
         if success:
             self.gui_target = None
+            self.gui_target_anchor_base = None
             self.gui_target_source = ""
         self.write_metadata()
 
     def go_to_initial_pose(self) -> None:
         if self.initial_T_base_tcp is None:
-            self.last_status = "back blocked: no initial pose captured"
+            self.report_status("back blocked: no initial pose captured", "warn")
             return
         if not self.param_bool("move_enabled"):
-            self.last_status = "back blocked: move_enabled is false"
-            self.get_logger().warn(self.last_status)
+            self.report_status("back blocked: move_enabled is false", "warn")
             return
         self.stop_jog(force=True)
         success = self.send_pose_goal(self.initial_T_base_tcp)
-        self.last_status = "back to start done" if success else "back to start failed"
+        self.report_status("back to start done" if success else "back to start failed", "info" if success else "warn")
 
     def send_pose_goal(self, T_base_tcp: np.ndarray) -> bool:
         if self.action_client is None or JparseMove is None:
@@ -642,6 +751,7 @@ class ClipObjectCaptureSession(Node):
         self.wait_for_future(future)
         goal_handle = future.result()
         if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().error("Move goal was rejected by the action server.")
             return False
         result_future = goal_handle.get_result_async()
         self.wait_for_future(result_future)

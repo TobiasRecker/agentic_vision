@@ -11,6 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from clip_pose_pipeline.capture_geometry import (  # noqa: E402
+    center_camera_target_from_pixel,
     center_camera_target,
     estimate_anchor_from_xyz_image,
     generate_spiral_hemisphere_targets,
@@ -61,6 +62,24 @@ def test_center_camera_target_places_anchor_on_optical_axis() -> None:
 
     np.testing.assert_allclose(centered_anchor[:2], [0.0, 0.0], atol=1.0e-9)
     np.testing.assert_allclose(target[:3, :3], np.eye(3), atol=1.0e-9)
+
+
+def test_center_camera_target_from_pixel_uses_intrinsics_and_fallback_depth() -> None:
+    T_base_camera = np.eye(4, dtype=np.float64)
+    K = np.array([[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]])
+
+    target, anchor = center_camera_target_from_pixel(
+        T_base_camera,
+        (370.0, 220.0),
+        K,
+        depth_m=0.5,
+        xy_only=False,
+    )
+
+    np.testing.assert_allclose(anchor, [0.05, -0.02, 0.5])
+    np.testing.assert_allclose(target[:3, 3], [0.05, -0.02, 0.0])
+    centered_anchor = transform_point(invert_transform(target), anchor)
+    np.testing.assert_allclose(centered_anchor[:2], [0.0, 0.0], atol=1.0e-9)
 
 
 def test_spiral_hemisphere_targets_keep_radius_and_look_at_anchor() -> None:

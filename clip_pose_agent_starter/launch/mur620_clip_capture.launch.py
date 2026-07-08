@@ -26,6 +26,8 @@ def generate_launch_description():
                 "robot_base_frame": LaunchConfiguration("robot_base_frame"),
                 "robot_tcp_frame": LaunchConfiguration("robot_tcp_frame"),
                 "camera_frame": LaunchConfiguration("camera_frame"),
+                "extra_tf_topics": LaunchConfiguration("extra_tf_topics"),
+                "extra_tf_static_topics": LaunchConfiguration("extra_tf_static_topics"),
                 "planning_frame": LaunchConfiguration("planning_frame"),
                 "action_name": LaunchConfiguration("action_name"),
                 "move_enabled": LaunchConfiguration("move_enabled"),
@@ -33,6 +35,8 @@ def generate_launch_description():
                 "jog_twist_topic": LaunchConfiguration("jog_twist_topic"),
                 "jog_frame": LaunchConfiguration("jog_frame"),
                 "samples": LaunchConfiguration("samples"),
+                "allow_2d_center_fallback": LaunchConfiguration("allow_2d_center_fallback"),
+                "fallback_center_depth_m": LaunchConfiguration("fallback_center_depth_m"),
             },
         ],
     )
@@ -58,6 +62,8 @@ def generate_launch_description():
             DeclareLaunchArgument("robot_base_frame", default_value="mur620/UR10_r/base_link"),
             DeclareLaunchArgument("robot_tcp_frame", default_value="mur620/UR10_r/tool0"),
             DeclareLaunchArgument("camera_frame", default_value=""),
+            DeclareLaunchArgument("extra_tf_topics", default_value=""),
+            DeclareLaunchArgument("extra_tf_static_topics", default_value=""),
             DeclareLaunchArgument("planning_frame", default_value="mur620/UR10_r/base_link"),
             DeclareLaunchArgument("action_name", default_value="/mur620/jparse_move_r"),
             DeclareLaunchArgument("move_enabled", default_value="false"),
@@ -68,6 +74,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("jog_frame", default_value="UR10_r/base_link"),
             DeclareLaunchArgument("samples", default_value="18"),
+            DeclareLaunchArgument("allow_2d_center_fallback", default_value="true"),
+            DeclareLaunchArgument("fallback_center_depth_m", default_value="0.45"),
             capture_node,
         ]
     )

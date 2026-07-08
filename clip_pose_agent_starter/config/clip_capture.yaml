@@ -11,6 +11,8 @@ clip_object_capture_session:
     robot_base_frame: mur620/UR10_r/base_link
     robot_tcp_frame: mur620/UR10_r/tool0
     camera_frame: ''
+    extra_tf_topics: ''
+    extra_tf_static_topics: ''
     planning_frame: mur620/UR10_r/base_link
 
     action_name: /mur620/jparse_move_r
@@ -22,6 +24,8 @@ clip_object_capture_session:
     click_window_radius: 4
     click_min_points: 8
     click_max_mad_m: 0.02
+    allow_2d_center_fallback: true
+    fallback_center_depth_m: 0.45
     samples: 18
     sphere_radius_m: 0.0
     sphere_polar_span_deg: 50.0

@@ -17,6 +17,8 @@ SESSION_NAME="${SESSION_NAME:-}"
 ROBOT_BASE_FRAME="${ROBOT_BASE_FRAME:-mur620/UR10_r/base_link}"
 ROBOT_TCP_FRAME="${ROBOT_TCP_FRAME:-mur620/UR10_r/tool0}"
 CAMERA_FRAME="${CAMERA_FRAME:-}"
+EXTRA_TF_TOPICS="${EXTRA_TF_TOPICS:-/mur620d/UR10_r/unused_tf}"
+EXTRA_TF_STATIC_TOPICS="${EXTRA_TF_STATIC_TOPICS:-/mur620d/UR10_r/unused_tf_static}"
 PLANNING_FRAME="${PLANNING_FRAME:-mur620/UR10_r/base_link}"
 ACTION_NAME="${ACTION_NAME:-/mur620/jparse_move_r}"
 MOVE_ENABLED="${MOVE_ENABLED:-false}"
@@ -24,6 +26,8 @@ KEYBOARD_JOG_ENABLED="${KEYBOARD_JOG_ENABLED:-false}"
 JOG_TWIST_TOPIC="${JOG_TWIST_TOPIC:-/mur620/jparse_velocity_controller_r/twist_cmd}"
 JOG_FRAME="${JOG_FRAME:-UR10_r/base_link}"
 SAMPLES="${SAMPLES:-18}"
+ALLOW_2D_CENTER_FALLBACK="${ALLOW_2D_CENTER_FALLBACK:-true}"
+FALLBACK_CENTER_DEPTH_M="${FALLBACK_CENTER_DEPTH_M:-0.45}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_ROOT="${CLIP_CAPTURE_LOG_DIR:-${OUTPUT_ROOT}/node_logs}"
@@ -42,6 +46,10 @@ echo "[clip_capture] image:     ${IMAGE_TOPIC} compressed=${IMAGE_COMPRESSED}"
 echo "[clip_capture] info:      ${CAMERA_INFO_TOPIC}"
 echo "[clip_capture] points:    ${POINTCLOUD_TOPIC}"
 echo "[clip_capture] move:      ${MOVE_ENABLED}; jog: ${KEYBOARD_JOG_ENABLED}"
+echo "[clip_capture] note:      z prepares a target; g sends it, and only if MOVE_ENABLED=true"
+echo "[clip_capture] 2D center: ${ALLOW_2D_CENTER_FALLBACK}; fallback depth ${FALLBACK_CENTER_DEPTH_M} m"
+echo "[clip_capture] extra TF:  ${EXTRA_TF_TOPICS}"
+echo "[clip_capture] extra S-TF:${EXTRA_TF_STATIC_TOPICS}"
 echo
 
 cd "${WS_DIR}"
@@ -50,7 +58,9 @@ colcon build --packages-select "${PACKAGE}" --symlink-install
 
 echo
 echo "[clip_capture] sourcing install/setup.bash..."
+set +u
 source "${WS_DIR}/install/setup.bash"
+set -u
 
 echo
 echo "[clip_capture] installed executables:"
@@ -59,27 +69,57 @@ ros2 pkg executables "${PACKAGE}" || true
 echo
 echo "[clip_capture] currently visible relevant topics:"
 ros2 topic list 2>/dev/null | grep -E '(^/oak|jparse|tf)' || true
-for topic in "${IMAGE_TOPIC}" "${CAMERA_INFO_TOPIC}" "${POINTCLOUD_TOPIC}"; do
+for topic in "${IMAGE_TOPIC}" "${CAMERA_INFO_TOPIC}" "${POINTCLOUD_TOPIC}" \
+  ${EXTRA_TF_TOPICS//,/ } ${EXTRA_TF_STATIC_TOPICS//,/ }; do
+  [[ -n "${topic}" ]] || continue
   echo -n "[clip_capture] topic type ${topic}: "
   ros2 topic type "${topic}" 2>/dev/null || true
 done
 
 echo
+echo "[clip_capture] camera_info sample:"
+timeout 3 ros2 topic echo --once "${CAMERA_INFO_TOPIC}" 2>/dev/null | grep -E 'frame_id|height|width' || true
+
+echo
+echo "[clip_capture] sampled TF frames relevant to robot/camera:"
+TF_SAMPLE_TOPICS="/tf_static /tf ${EXTRA_TF_STATIC_TOPICS//,/ } ${EXTRA_TF_TOPICS//,/ }"
+for tf_topic in ${TF_SAMPLE_TOPICS}; do
+  [[ -n "${tf_topic}" ]] || continue
+  echo "[clip_capture] ${tf_topic}:"
+  timeout 3 ros2 topic echo --once "${tf_topic}" 2>/dev/null \
+    | grep -E 'frame_id|child_frame_id' \
+    | grep -E 'mur620|mur620d|UR10|tool0|base_link|oak|camera|rgb|optical' \
+    | sort -u || true
+done
+
+echo
 echo "[clip_capture] launching..."
-ros2 launch "${PACKAGE}" "${LAUNCH_FILE}" \
-  image_topic:="${IMAGE_TOPIC}" \
-  image_compressed:="${IMAGE_COMPRESSED}" \
-  camera_info_topic:="${CAMERA_INFO_TOPIC}" \
-  pointcloud_topic:="${POINTCLOUD_TOPIC}" \
-  output_root:="${OUTPUT_ROOT}" \
-  session_name:="${SESSION_NAME}" \
-  robot_base_frame:="${ROBOT_BASE_FRAME}" \
-  robot_tcp_frame:="${ROBOT_TCP_FRAME}" \
-  camera_frame:="${CAMERA_FRAME}" \
-  planning_frame:="${PLANNING_FRAME}" \
-  action_name:="${ACTION_NAME}" \
-  move_enabled:="${MOVE_ENABLED}" \
-  keyboard_jog_enabled:="${KEYBOARD_JOG_ENABLED}" \
-  jog_twist_topic:="${JOG_TWIST_TOPIC}" \
-  jog_frame:="${JOG_FRAME}" \
+LAUNCH_ARGS=(
+  image_topic:="${IMAGE_TOPIC}"
+  image_compressed:="${IMAGE_COMPRESSED}"
+  camera_info_topic:="${CAMERA_INFO_TOPIC}"
+  pointcloud_topic:="${POINTCLOUD_TOPIC}"
+  output_root:="${OUTPUT_ROOT}"
+  robot_base_frame:="${ROBOT_BASE_FRAME}"
+  robot_tcp_frame:="${ROBOT_TCP_FRAME}"
+  extra_tf_topics:="${EXTRA_TF_TOPICS}"
+  extra_tf_static_topics:="${EXTRA_TF_STATIC_TOPICS}"
+  planning_frame:="${PLANNING_FRAME}"
+  action_name:="${ACTION_NAME}"
+  move_enabled:="${MOVE_ENABLED}"
+  keyboard_jog_enabled:="${KEYBOARD_JOG_ENABLED}"
+  jog_twist_topic:="${JOG_TWIST_TOPIC}"
+  jog_frame:="${JOG_FRAME}"
   samples:="${SAMPLES}"
+  allow_2d_center_fallback:="${ALLOW_2D_CENTER_FALLBACK}"
+  fallback_center_depth_m:="${FALLBACK_CENTER_DEPTH_M}"
+)
+if [[ -n "${SESSION_NAME}" ]]; then
+  LAUNCH_ARGS+=(session_name:="${SESSION_NAME}")
+fi
+if [[ -n "${CAMERA_FRAME}" ]]; then
+  LAUNCH_ARGS+=(camera_frame:="${CAMERA_FRAME}")
+fi
+
+printf '[clip_capture] launch arg: %q\n' "${LAUNCH_ARGS[@]}"
+ros2 launch "${PACKAGE}" "${LAUNCH_FILE}" "${LAUNCH_ARGS[@]}"
