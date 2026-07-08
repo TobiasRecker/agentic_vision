@@ -1,0 +1,7 @@
+{
+  "frames": {
+    "base": "robot_base",
+    "camera": "wrist_camera_optical"
+  },
+  "poses": []
+}

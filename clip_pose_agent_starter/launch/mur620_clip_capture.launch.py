@@ -1,0 +1,71 @@
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+    params_file = LaunchConfiguration("params_file")
+
+    capture_node = Node(
+        package="clip_pose_agent_starter",
+        executable="clip_object_capture_session",
+        name="clip_object_capture_session",
+        output="screen",
+        emulate_tty=True,
+        parameters=[
+            params_file,
+            {
+                "image_topic": LaunchConfiguration("image_topic"),
+                "camera_info_topic": LaunchConfiguration("camera_info_topic"),
+                "pointcloud_topic": LaunchConfiguration("pointcloud_topic"),
+                "output_root": LaunchConfiguration("output_root"),
+                "session_name": LaunchConfiguration("session_name"),
+                "robot_base_frame": LaunchConfiguration("robot_base_frame"),
+                "robot_tcp_frame": LaunchConfiguration("robot_tcp_frame"),
+                "camera_frame": LaunchConfiguration("camera_frame"),
+                "planning_frame": LaunchConfiguration("planning_frame"),
+                "action_name": LaunchConfiguration("action_name"),
+                "move_enabled": LaunchConfiguration("move_enabled"),
+                "keyboard_jog_enabled": LaunchConfiguration("keyboard_jog_enabled"),
+                "jog_twist_topic": LaunchConfiguration("jog_twist_topic"),
+                "jog_frame": LaunchConfiguration("jog_frame"),
+                "samples": LaunchConfiguration("samples"),
+            },
+        ],
+    )
+
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "params_file",
+                default_value=PathJoinSubstitution(
+                    [
+                        FindPackageShare("clip_pose_agent_starter"),
+                        "config",
+                        "clip_capture.yaml",
+                    ]
+                ),
+            ),
+            DeclareLaunchArgument("image_topic", default_value="/oak/rgb/image_raw"),
+            DeclareLaunchArgument("camera_info_topic", default_value="/oak/rgb/camera_info"),
+            DeclareLaunchArgument("pointcloud_topic", default_value="/oak/rgbd/points"),
+            DeclareLaunchArgument("output_root", default_value="~/clip_pose_sessions"),
+            DeclareLaunchArgument("session_name", default_value=""),
+            DeclareLaunchArgument("robot_base_frame", default_value="mur620/UR10_r/base_link"),
+            DeclareLaunchArgument("robot_tcp_frame", default_value="mur620/UR10_r/tool0"),
+            DeclareLaunchArgument("camera_frame", default_value=""),
+            DeclareLaunchArgument("planning_frame", default_value="mur620/UR10_r/base_link"),
+            DeclareLaunchArgument("action_name", default_value="/mur620/jparse_move_r"),
+            DeclareLaunchArgument("move_enabled", default_value="false"),
+            DeclareLaunchArgument("keyboard_jog_enabled", default_value="false"),
+            DeclareLaunchArgument(
+                "jog_twist_topic",
+                default_value="/mur620/jparse_velocity_controller_r/twist_cmd",
+            ),
+            DeclareLaunchArgument("jog_frame", default_value="UR10_r/base_link"),
+            DeclareLaunchArgument("samples", default_value="18"),
+            capture_node,
+        ]
+    )

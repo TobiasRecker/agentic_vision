@@ -1,0 +1,36 @@
+session_dir: examples/data_session
+output_dir: results
+
+intrinsics_file: intrinsics.yaml
+camera_poses_file: camera_poses.json
+clip_model_file: ../models/clip_model.yaml
+
+detector:
+  backend: manual_keypoints
+  detections_file: detections.json
+  # Used by future automatic backends.
+  roi: null
+  prompt: "plastic pipe clip. conduit clamp. cable conduit holder."
+  box_threshold: 0.30
+  text_threshold: 0.25
+  hsv_lower: [0, 0, 0]
+  hsv_upper: [179, 255, 255]
+  canny_thresholds: [50, 150]
+  contour_min_area: 100
+  contour_max_area: 20000
+  morph_kernel: 3
+
+optimizer:
+  robust_loss: soft_l1
+  f_scale_px: 3.0
+  min_views: 6
+  min_keypoints_per_view: 4
+  confidence_threshold: 0.5
+  max_nfev: 500
+
+acceptance:
+  reprojection_rmse_px: 3.0
+  median_view_error_px: 4.0
+  split_translation_error_m: 0.002
+  split_rotation_error_deg: 2.0
+  min_valid_views: 6

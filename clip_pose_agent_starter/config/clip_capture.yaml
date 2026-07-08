@@ -1,0 +1,37 @@
+clip_object_capture_session:
+  ros__parameters:
+    image_topic: /oak/rgb/image_raw
+    camera_info_topic: /oak/rgb/camera_info
+    pointcloud_topic: /oak/rgbd/points
+    output_root: ~/clip_pose_sessions
+    session_name: ''
+    sample_prefix: sample
+
+    robot_base_frame: mur620/UR10_r/base_link
+    robot_tcp_frame: mur620/UR10_r/tool0
+    camera_frame: ''
+    planning_frame: mur620/UR10_r/base_link
+
+    action_name: /mur620/jparse_move_r
+    move_enabled: false
+    keyboard_jog_enabled: false
+    jog_twist_topic: /mur620/jparse_velocity_controller_r/twist_cmd
+    jog_frame: UR10_r/base_link
+
+    click_window_radius: 4
+    click_min_points: 8
+    click_max_mad_m: 0.02
+    samples: 18
+    sphere_radius_m: 0.0
+    sphere_polar_span_deg: 50.0
+    sphere_spiral_turns: 1.25
+    camera_look_axis: plus_z
+    center_camera_xy_only: true
+
+    target_min_camera_delta_m: 0.04
+    target_max_tcp_delta_m: 0.25
+    target_max_camera_delta_m: 0.30
+    target_max_rotation_deg: 35.0
+    max_linear_velocity: 0.025
+    max_angular_velocity: 0.10
+    move_timeout: 30.0
