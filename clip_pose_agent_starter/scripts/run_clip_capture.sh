@@ -7,6 +7,7 @@ WS_DIR="$(cd "${PKG_DIR}/../../.." && pwd)"
 
 PACKAGE="clip_pose_agent_starter"
 LAUNCH_FILE="mur620_clip_capture.launch.py"
+ROBOT_NAME="${ROBOT_NAME:-mur620d}"
 
 IMAGE_TOPIC="${IMAGE_TOPIC:-/oak/rgb/image_raw/compressed}"
 IMAGE_COMPRESSED="${IMAGE_COMPRESSED:-true}"
@@ -14,16 +15,19 @@ CAMERA_INFO_TOPIC="${CAMERA_INFO_TOPIC:-/oak/rgb/camera_info}"
 POINTCLOUD_TOPIC="${POINTCLOUD_TOPIC:-/oak/rgbd/points}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${HOME}/clip_pose_sessions}"
 SESSION_NAME="${SESSION_NAME:-}"
-ROBOT_BASE_FRAME="${ROBOT_BASE_FRAME:-mur620/UR10_r/base_link}"
-ROBOT_TCP_FRAME="${ROBOT_TCP_FRAME:-mur620/UR10_r/tool0}"
+ROBOT_BASE_FRAME="${ROBOT_BASE_FRAME:-${ROBOT_NAME}/UR10_r/base_link}"
+ROBOT_TCP_FRAME="${ROBOT_TCP_FRAME:-${ROBOT_NAME}/UR10_r/tool0}"
 CAMERA_FRAME="${CAMERA_FRAME:-}"
-EXTRA_TF_TOPICS="${EXTRA_TF_TOPICS:-/mur620d/UR10_r/unused_tf}"
-EXTRA_TF_STATIC_TOPICS="${EXTRA_TF_STATIC_TOPICS:-/mur620d/UR10_r/unused_tf_static}"
-PLANNING_FRAME="${PLANNING_FRAME:-mur620/UR10_r/base_link}"
-ACTION_NAME="${ACTION_NAME:-/mur620/jparse_move_r}"
+EXTRA_TF_TOPICS="${EXTRA_TF_TOPICS:-}"
+EXTRA_TF_STATIC_TOPICS="${EXTRA_TF_STATIC_TOPICS:-}"
+USE_CONFIGURED_TCP_TO_CAMERA="${USE_CONFIGURED_TCP_TO_CAMERA:-true}"
+TCP_TO_CAMERA_TRANSLATION_XYZ="${TCP_TO_CAMERA_TRANSLATION_XYZ:-0.0068564203,-0.0892312561,0.1018930213}"
+TCP_TO_CAMERA_QUATERNION_XYZW="${TCP_TO_CAMERA_QUATERNION_XYZW:-0.0241307793,-0.0030488269,-0.0062149980,0.9996848423}"
+PLANNING_FRAME="${PLANNING_FRAME:-${ROBOT_NAME}/UR10_r/base_link}"
+ACTION_NAME="${ACTION_NAME:-/${ROBOT_NAME}/jparse_move_r}"
 MOVE_ENABLED="${MOVE_ENABLED:-false}"
 KEYBOARD_JOG_ENABLED="${KEYBOARD_JOG_ENABLED:-false}"
-JOG_TWIST_TOPIC="${JOG_TWIST_TOPIC:-/mur620/jparse_velocity_controller_r/twist_cmd}"
+JOG_TWIST_TOPIC="${JOG_TWIST_TOPIC:-/${ROBOT_NAME}/jparse_velocity_controller_r/twist_cmd}"
 JOG_FRAME="${JOG_FRAME:-UR10_r/base_link}"
 SAMPLES="${SAMPLES:-18}"
 ALLOW_2D_CENTER_FALLBACK="${ALLOW_2D_CENTER_FALLBACK:-true}"
@@ -42,6 +46,7 @@ echo "[clip_capture] workspace: ${WS_DIR}"
 echo "[clip_capture] package:   ${PACKAGE}"
 echo "[clip_capture] log file:  ${LOG_FILE}"
 echo "[clip_capture] ros logs:  ${ROS_LOG_DIR}"
+echo "[clip_capture] robot:    ${ROBOT_NAME}"
 echo "[clip_capture] image:     ${IMAGE_TOPIC} compressed=${IMAGE_COMPRESSED}"
 echo "[clip_capture] info:      ${CAMERA_INFO_TOPIC}"
 echo "[clip_capture] points:    ${POINTCLOUD_TOPIC}"
@@ -50,6 +55,9 @@ echo "[clip_capture] note:      z prepares a target; g sends it, and only if MOV
 echo "[clip_capture] 2D center: ${ALLOW_2D_CENTER_FALLBACK}; fallback depth ${FALLBACK_CENTER_DEPTH_M} m"
 echo "[clip_capture] extra TF:  ${EXTRA_TF_TOPICS}"
 echo "[clip_capture] extra S-TF:${EXTRA_TF_STATIC_TOPICS}"
+echo "[clip_capture] handeye:  configured=${USE_CONFIGURED_TCP_TO_CAMERA}"
+echo "[clip_capture] handeye t:${TCP_TO_CAMERA_TRANSLATION_XYZ}"
+echo "[clip_capture] handeye q:${TCP_TO_CAMERA_QUATERNION_XYZW}"
 echo
 
 cd "${WS_DIR}"
@@ -72,9 +80,17 @@ ros2 topic list 2>/dev/null | grep -E '(^/oak|jparse|tf)' || true
 for topic in "${IMAGE_TOPIC}" "${CAMERA_INFO_TOPIC}" "${POINTCLOUD_TOPIC}" \
   ${EXTRA_TF_TOPICS//,/ } ${EXTRA_TF_STATIC_TOPICS//,/ }; do
   [[ -n "${topic}" ]] || continue
-  echo -n "[clip_capture] topic type ${topic}: "
-  ros2 topic type "${topic}" 2>/dev/null || true
+  topic_type="$(ros2 topic type "${topic}" 2>/dev/null || true)"
+  echo "[clip_capture] topic type ${topic}: ${topic_type:-<not visible>}"
 done
+
+echo
+echo "[clip_capture] currently visible relevant actions:"
+visible_actions="$(timeout 3 ros2 action list 2>/dev/null || true)"
+printf '%s\n' "${visible_actions}" | grep -E 'jparse|move|UR10|mur620' || true
+if ! printf '%s\n' "${visible_actions}" | grep -Fxq "${ACTION_NAME}"; then
+  echo "[clip_capture] WARNING: action ${ACTION_NAME} is not currently visible"
+fi
 
 echo
 echo "[clip_capture] camera_info sample:"
@@ -102,8 +118,9 @@ LAUNCH_ARGS=(
   output_root:="${OUTPUT_ROOT}"
   robot_base_frame:="${ROBOT_BASE_FRAME}"
   robot_tcp_frame:="${ROBOT_TCP_FRAME}"
-  extra_tf_topics:="${EXTRA_TF_TOPICS}"
-  extra_tf_static_topics:="${EXTRA_TF_STATIC_TOPICS}"
+  use_configured_tcp_to_camera:="${USE_CONFIGURED_TCP_TO_CAMERA}"
+  tcp_to_camera_translation_xyz:="${TCP_TO_CAMERA_TRANSLATION_XYZ}"
+  tcp_to_camera_quaternion_xyzw:="${TCP_TO_CAMERA_QUATERNION_XYZW}"
   planning_frame:="${PLANNING_FRAME}"
   action_name:="${ACTION_NAME}"
   move_enabled:="${MOVE_ENABLED}"
@@ -119,6 +136,12 @@ if [[ -n "${SESSION_NAME}" ]]; then
 fi
 if [[ -n "${CAMERA_FRAME}" ]]; then
   LAUNCH_ARGS+=(camera_frame:="${CAMERA_FRAME}")
+fi
+if [[ -n "${EXTRA_TF_TOPICS}" ]]; then
+  LAUNCH_ARGS+=(extra_tf_topics:="${EXTRA_TF_TOPICS}")
+fi
+if [[ -n "${EXTRA_TF_STATIC_TOPICS}" ]]; then
+  LAUNCH_ARGS+=(extra_tf_static_topics:="${EXTRA_TF_STATIC_TOPICS}")
 fi
 
 printf '[clip_capture] launch arg: %q\n' "${LAUNCH_ARGS[@]}"

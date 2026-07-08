@@ -67,13 +67,16 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("output_root", "~/clip_pose_sessions")
         self.declare_parameter("session_name", "")
         self.declare_parameter("sample_prefix", "sample")
-        self.declare_parameter("robot_base_frame", "mur620/UR10_r/base_link")
-        self.declare_parameter("robot_tcp_frame", "mur620/UR10_r/tool0")
+        self.declare_parameter("robot_base_frame", "mur620d/UR10_r/base_link")
+        self.declare_parameter("robot_tcp_frame", "mur620d/UR10_r/tool0")
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("extra_tf_topics", "")
         self.declare_parameter("extra_tf_static_topics", "")
-        self.declare_parameter("planning_frame", "mur620/UR10_r/base_link")
-        self.declare_parameter("action_name", "/mur620/jparse_move_r")
+        self.declare_parameter("use_configured_tcp_to_camera", True)
+        self.declare_parameter("tcp_to_camera_translation_xyz", "0.0068564203,-0.0892312561,0.1018930213")
+        self.declare_parameter("tcp_to_camera_quaternion_xyzw", "0.0241307793,-0.0030488269,-0.0062149980,0.9996848423")
+        self.declare_parameter("planning_frame", "mur620d/UR10_r/base_link")
+        self.declare_parameter("action_name", "/mur620d/jparse_move_r")
         self.declare_parameter("move_enabled", False)
         self.declare_parameter("keyboard_jog_enabled", False)
         self.declare_parameter("jog_twist_topic", "/mur620/jparse_velocity_controller_r/twist_cmd")
@@ -152,6 +155,8 @@ class ClipObjectCaptureSession(Node):
         self.last_jog_update_time = time.monotonic()
 
         self.initial_T_base_tcp: np.ndarray | None = None
+        self._configured_T_tcp_camera: np.ndarray | None = None
+        self._reported_configured_tcp_camera = False
         self.clicked_pixel_uv: list[float] | None = None
         self.anchor: dict[str, Any] | None = None
         self.gui_target: np.ndarray | None = None
@@ -185,6 +190,25 @@ class ClipObjectCaptureSession(Node):
         if isinstance(value, (list, tuple)):
             return [str(item).strip() for item in value if str(item).strip()]
         return [item.strip() for item in str(value).split(",") if item.strip()]
+
+    def param_float_list(self, name: str, expected_len: int) -> list[float] | None:
+        value = self.get_parameter(name).value
+        if isinstance(value, (list, tuple)):
+            parts = list(value)
+        else:
+            text = str(value).replace(";", ",")
+            parts = [part.strip() for part in text.split(",") if part.strip()]
+        if len(parts) != expected_len:
+            self.report_status(
+                f"parameter {name} needs {expected_len} values, got {len(parts)}: {value}",
+                "warn",
+            )
+            return None
+        try:
+            return [float(part) for part in parts]
+        except (TypeError, ValueError) as exc:
+            self.report_status(f"parameter {name} contains non-float values: {exc}", "warn")
+            return None
 
     def report_status(self, message: str, level: str = "info") -> None:
         self.last_status = message
@@ -239,6 +263,18 @@ class ClipObjectCaptureSession(Node):
             self._extra_tf_seen.add(topic)
             kind = "static TF" if is_static else "TF"
             self.get_logger().info(f"Ingested {len(msg.transforms)} {kind} transforms from {topic}")
+
+    def configured_tcp_camera_transform(self) -> np.ndarray | None:
+        if not self.param_bool("use_configured_tcp_to_camera"):
+            return None
+        if self._configured_T_tcp_camera is not None:
+            return self._configured_T_tcp_camera
+        translation = self.param_float_list("tcp_to_camera_translation_xyz", 3)
+        quaternion = self.param_float_list("tcp_to_camera_quaternion_xyzw", 4)
+        if translation is None or quaternion is None:
+            return None
+        self._configured_T_tcp_camera = transform_from_translation_quaternion(translation, quaternion)
+        return self._configured_T_tcp_camera
 
     def run_gui_session(self) -> None:
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
@@ -429,12 +465,24 @@ class ClipObjectCaptureSession(Node):
         T_base_tcp = self.lookup_transform_matrix(self.param_str("robot_base_frame"), self.param_str("robot_tcp_frame"))
         if T_base_tcp is None:
             return None
-        T_base_camera = self.lookup_transform_matrix(self.param_str("robot_base_frame"), camera_frame)
-        if T_base_camera is None:
-            return None
-        T_tcp_camera = self.lookup_transform_matrix(self.param_str("robot_tcp_frame"), camera_frame)
-        if T_tcp_camera is None:
-            return None
+        T_tcp_camera = self.configured_tcp_camera_transform()
+        if T_tcp_camera is not None:
+            T_base_camera = T_base_tcp @ T_tcp_camera
+            if not self._reported_configured_tcp_camera:
+                self._reported_configured_tcp_camera = True
+                p = T_tcp_camera[:3, 3]
+                self.get_logger().info(
+                    "Using configured TCP->camera transform "
+                    f"for {self.param_str('robot_tcp_frame')}->{camera_frame}: "
+                    f"[{p[0]:.4f}, {p[1]:.4f}, {p[2]:.4f}]"
+                )
+        else:
+            T_base_camera = self.lookup_transform_matrix(self.param_str("robot_base_frame"), camera_frame)
+            if T_base_camera is None:
+                return None
+            T_tcp_camera = self.lookup_transform_matrix(self.param_str("robot_tcp_frame"), camera_frame)
+            if T_tcp_camera is None:
+                return None
 
         if self.initial_T_base_tcp is None:
             self.initial_T_base_tcp = T_base_tcp.copy()
@@ -957,6 +1005,9 @@ class ClipObjectCaptureSession(Node):
                 "tcp": self.param_str("robot_tcp_frame"),
                 "camera_override": self.param_str("camera_frame") or None,
                 "planning": self.param_str("planning_frame"),
+                "use_configured_tcp_to_camera": self.param_bool("use_configured_tcp_to_camera"),
+                "tcp_to_camera_translation_xyz": self.param_str("tcp_to_camera_translation_xyz"),
+                "tcp_to_camera_quaternion_xyzw": self.param_str("tcp_to_camera_quaternion_xyzw"),
             },
             "motion": {
                 "move_enabled": self.param_bool("move_enabled"),

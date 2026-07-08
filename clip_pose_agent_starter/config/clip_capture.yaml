@@ -8,17 +8,20 @@ clip_object_capture_session:
     session_name: ''
     sample_prefix: sample
 
-    robot_base_frame: mur620/UR10_r/base_link
-    robot_tcp_frame: mur620/UR10_r/tool0
+    robot_base_frame: mur620d/UR10_r/base_link
+    robot_tcp_frame: mur620d/UR10_r/tool0
     camera_frame: ''
     extra_tf_topics: ''
     extra_tf_static_topics: ''
-    planning_frame: mur620/UR10_r/base_link
+    use_configured_tcp_to_camera: true
+    tcp_to_camera_translation_xyz: 0.0068564203,-0.0892312561,0.1018930213
+    tcp_to_camera_quaternion_xyzw: 0.0241307793,-0.0030488269,-0.0062149980,0.9996848423
+    planning_frame: mur620d/UR10_r/base_link
 
-    action_name: /mur620/jparse_move_r
+    action_name: /mur620d/jparse_move_r
     move_enabled: false
     keyboard_jog_enabled: false
-    jog_twist_topic: /mur620/jparse_velocity_controller_r/twist_cmd
+    jog_twist_topic: /mur620d/jparse_velocity_controller_r/twist_cmd
     jog_frame: UR10_r/base_link
 
     click_window_radius: 4
