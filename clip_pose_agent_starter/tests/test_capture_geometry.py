@@ -19,6 +19,7 @@ from clip_pose_pipeline.capture_geometry import (  # noqa: E402
     target_motion_metrics,
     transform_from_translation_quaternion,
     transform_point,
+    xyz_image_from_organized_points,
 )
 
 
@@ -42,6 +43,42 @@ def test_estimate_anchor_from_organized_pointcloud_window() -> None:
     assert estimate.point_camera is not None
     np.testing.assert_allclose(estimate.point_camera, [0.10, -0.02, 0.42], atol=0.004)
     assert estimate.samples_finite >= 8
+
+
+def test_xyz_image_from_organized_points_keeps_native_layout() -> None:
+    points = np.zeros((720, 1280, 3), dtype=np.float64)
+    points[421, 704] = [0.1, -0.02, 0.42]
+
+    xyz, layout = xyz_image_from_organized_points(points, width=1280, height=720)
+
+    assert layout == "native"
+    assert xyz is not None
+    assert xyz.shape == (720, 1280, 3)
+    np.testing.assert_allclose(xyz[421, 704], [0.1, -0.02, 0.42])
+
+
+def test_xyz_image_from_organized_points_transposes_driver_layout() -> None:
+    points = np.zeros((1280, 720, 3), dtype=np.float64)
+    points[704, 421] = [0.1, -0.02, 0.42]
+
+    xyz, layout = xyz_image_from_organized_points(points, width=1280, height=720)
+
+    assert layout == "transposed"
+    assert xyz is not None
+    assert xyz.shape == (720, 1280, 3)
+    np.testing.assert_allclose(xyz[421, 704], [0.1, -0.02, 0.42])
+
+
+def test_xyz_image_from_organized_points_reshapes_flat_layout() -> None:
+    points = np.zeros((720 * 1280, 3), dtype=np.float64)
+    points[421 * 1280 + 704] = [0.1, -0.02, 0.42]
+
+    xyz, layout = xyz_image_from_organized_points(points, width=1280, height=720)
+
+    assert layout == "flat"
+    assert xyz is not None
+    assert xyz.shape == (720, 1280, 3)
+    np.testing.assert_allclose(xyz[421, 704], [0.1, -0.02, 0.42])
 
 
 def test_transform_point_camera_to_base() -> None:

@@ -130,6 +130,44 @@ def slew_vector(current: np.ndarray, target: np.ndarray, max_delta: float) -> np
     return current + delta * (float(max_delta) / norm)
 
 
+def xyz_image_from_organized_points(
+    points: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray | None, str]:
+    arr = np.asarray(points)
+    if arr.dtype.fields:
+        try:
+            arr = np.stack([arr["x"], arr["y"], arr["z"]], axis=-1)
+        except (KeyError, ValueError):
+            return None, f"pointcloud fields do not contain x/y/z: {arr.dtype.names}"
+
+    expected = (int(height), int(width))
+    transposed = (int(width), int(height))
+
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        if arr.shape[:2] == expected:
+            return np.asarray(arr[:, :, :3], dtype=np.float64), "native"
+        if arr.shape[:2] == transposed:
+            return np.asarray(np.swapaxes(arr[:, :, :3], 0, 1), dtype=np.float64), "transposed"
+        return None, f"pointcloud has unexpected shape {arr.shape}"
+
+    try:
+        arr = arr.reshape(expected[0], expected[1], -1)
+    except ValueError:
+        try:
+            arr = arr.reshape(transposed[0], transposed[1], -1)
+        except ValueError:
+            return None, f"pointcloud has unexpected shape {arr.shape}"
+        if arr.shape[2] < 3:
+            return None, f"pointcloud has too few fields after reshape {arr.shape}"
+        return np.asarray(np.swapaxes(arr[:, :, :3], 0, 1), dtype=np.float64), "transposed_flat"
+
+    if arr.shape[2] < 3:
+        return None, f"pointcloud has too few fields after reshape {arr.shape}"
+    return np.asarray(arr[:, :, :3], dtype=np.float64), "flat"
+
+
 def estimate_anchor_from_xyz_image(
     xyz_image: np.ndarray,
     pixel_uv: tuple[float, float] | list[float] | np.ndarray,

@@ -37,6 +37,7 @@ from .capture_geometry import (
     target_motion_metrics,
     transform_from_translation_quaternion,
     transform_point,
+    xyz_image_from_organized_points,
 )
 
 try:
@@ -124,6 +125,7 @@ class ClipObjectCaptureSession(Node):
         self.latest_image_msg: Image | CompressedImage | None = None
         self.latest_camera_info: CameraInfo | None = None
         self.latest_cloud_msg: PointCloud2 | None = None
+        self._pointcloud_layout_notice: str | None = None
         self.image_compressed = self.param_bool("image_compressed") or self.param_str("image_topic").endswith(
             "/compressed"
         )
@@ -633,16 +635,21 @@ class ClipObjectCaptureSession(Node):
         except Exception as exc:  # noqa: BLE001
             self.report_status(f"pointcloud decode failed: {exc}", "warn")
             return None
-        arr = np.asarray(points)
-        if arr.dtype.fields:
-            arr = np.stack([arr["x"], arr["y"], arr["z"]], axis=-1)
-        if arr.ndim != 3 or arr.shape[2] < 3:
-            try:
-                arr = arr.reshape(int(cloud_msg.height), int(cloud_msg.width), -1)
-            except ValueError:
-                self.report_status(f"pointcloud has unexpected shape {arr.shape}", "warn")
-                return None
-        return np.asarray(arr[:, :, :3], dtype=np.float64)
+        xyz, layout = xyz_image_from_organized_points(
+            np.asarray(points),
+            width=int(cloud_msg.width),
+            height=int(cloud_msg.height),
+        )
+        if xyz is None:
+            self.report_status(layout, "warn")
+            return None
+        if layout != "native" and self._pointcloud_layout_notice != layout:
+            self._pointcloud_layout_notice = layout
+            self.get_logger().info(
+                f"PointCloud2 array layout '{layout}' normalized to "
+                f"{cloud_msg.width}x{cloud_msg.height}"
+            )
+        return xyz
 
     def handle_key(self, key: int) -> bool:
         char = ascii_char(key)
