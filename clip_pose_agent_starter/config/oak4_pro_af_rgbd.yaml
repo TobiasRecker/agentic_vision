@@ -1,0 +1,32 @@
+/oak:
+  ros__parameters:
+    driver:
+      i_enable_ir: false
+      i_pipeline_auto_calibration_mode: ''
+    pipeline_gen:
+      i_enable_imu: false
+      i_enable_rgbd: true
+      i_enable_sync: true
+      i_nn_type: none
+      i_pipeline_type: rgbd
+    rgb:
+      i_board_socket_id: 0
+      i_disable_node: false
+      i_enable_feature_tracker: false
+      i_enable_lazy_publisher: false
+      i_enable_nn: false
+      i_fps: 15.0
+      i_height: 1080
+      i_low_bandwidth: true
+      i_low_bandwidth_quality: 75
+      i_max_q_size: 2
+      i_publish_compressed: true
+      i_publish_raw: false
+      i_publish_topic: true
+      i_synced: true
+      i_undistorted: false
+      i_width: 1920
+    stereo:
+      i_depth_preset: DEFAULT
+      i_publish_topic: true
+      i_synced: true

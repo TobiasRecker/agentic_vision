@@ -26,6 +26,7 @@ from tf2_msgs.msg import TFMessage
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from .capture_geometry import (
+    camera_point_from_pixel,
     center_camera_target_from_pixel,
     center_camera_target,
     estimate_anchor_from_xyz_image,
@@ -403,16 +404,16 @@ class ClipObjectCaptureSession(Node):
 
     def set_anchor_from_click(self, pixel_uv: tuple[float, float]) -> None:
         self.clicked_pixel_uv = [float(pixel_uv[0]), float(pixel_uv[1])]
+        self.target_cache = []
+        self.target_cursor = 0
+        self.gui_target = None
+        self.gui_target_source = ""
         self.get_logger().info(f"Click received at pixel [{pixel_uv[0]:.1f}, {pixel_uv[1]:.1f}]")
         observation = self.current_observation(require_cloud=False)
         if observation is None:
             return
         if self.latest_cloud_msg is None:
-            self.report_status(
-                "2D click stored; no PointCloud2 yet. "
-                "z can prepare approximate center target using fallback depth.",
-                "warn",
-            )
+            self.set_fallback_anchor_from_click(pixel_uv, observation, "no PointCloud2 yet")
             return
         xyz = self.pointcloud_xyz_image(observation.cloud_msg)
         if xyz is None:
@@ -473,6 +474,63 @@ class ClipObjectCaptureSession(Node):
         self.write_metadata()
         if self.param_bool("save_anchor_approx_tf"):
             self.write_anchor_approx_tf(observation.T_base_camera)
+
+    def set_fallback_anchor_from_click(
+        self,
+        pixel_uv: tuple[float, float],
+        observation: Observation,
+        reason: str,
+    ) -> bool:
+        if not self.param_bool("allow_2d_center_fallback"):
+            self.report_status(
+                f"2D click stored; {reason}, and 2D fallback is disabled.",
+                "warn",
+            )
+            return False
+
+        K = np.asarray(observation.camera_info.k, dtype=np.float64).reshape(3, 3)
+        depth_m = float(self.get_parameter("fallback_center_depth_m").value)
+        try:
+            point_camera = camera_point_from_pixel(pixel_uv, K, depth_m)
+        except ValueError as exc:
+            self.report_status(f"2D fallback anchor blocked: {exc}", "warn")
+            return False
+
+        p_base_anchor = transform_point(observation.T_base_camera, point_camera)
+        self.anchor = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "pixel_uv": [float(pixel_uv[0]), float(pixel_uv[1])],
+            "camera_frame": observation.camera_frame,
+            "base_frame": self.param_str("robot_base_frame"),
+            "p_camera_anchor": point_camera.astype(float).tolist(),
+            "p_base_anchor": p_base_anchor.astype(float).tolist(),
+            "quality": {
+                "valid": True,
+                "source": "2d_fallback_depth",
+                "depth_m": depth_m,
+                "reason": reason,
+            },
+            "source": "manual_click_2d_fallback_depth",
+            "image_stamp": stamp_dict(observation.image_msg.header.stamp),
+            "cloud_stamp": None,
+            "T_base_camera_at_click": matrix_to_list(observation.T_base_camera),
+        }
+        self.clicked_pixel_uv = [float(pixel_uv[0]), float(pixel_uv[1])]
+        self.target_cache = []
+        self.target_cursor = 0
+        self.gui_target = None
+        self.gui_target_source = ""
+        self.report_status(
+            "approx anchor set from 2D click: "
+            f"base=[{p_base_anchor[0]:.3f}, {p_base_anchor[1]:.3f}, {p_base_anchor[2]:.3f}], "
+            f"depth={depth_m:.3f}m",
+            "warn",
+        )
+        self.write_anchors()
+        self.write_metadata()
+        if self.param_bool("save_anchor_approx_tf"):
+            self.write_anchor_approx_tf(observation.T_base_camera)
+        return True
 
     def current_observation(self, require_cloud: bool = False) -> Observation | None:
         if self.latest_image_msg is None:
@@ -642,7 +700,11 @@ class ClipObjectCaptureSession(Node):
                 xy_only=self.param_bool("center_camera_xy_only"),
                 look_axis=self.param_str("camera_look_axis"),
             )
-            source = "center_3d_anchor"
+            source = (
+                "center_2d_fallback_anchor"
+                if self.anchor.get("source") == "manual_click_2d_fallback_depth"
+                else "center_3d_anchor"
+            )
         elif self.param_bool("allow_2d_center_fallback"):
             K = np.asarray(observation.camera_info.k, dtype=np.float64).reshape(3, 3)
             T_base_camera_target, anchor_base = center_camera_target_from_pixel(
@@ -960,7 +1022,7 @@ class ClipObjectCaptureSession(Node):
 
     def save_sample(self) -> None:
         if self.anchor is None:
-            self.last_status = "save blocked: click an anchor first"
+            self.report_status("save blocked: click an anchor first", "warn")
             return
         observation = self.current_observation(require_cloud=False)
         if observation is None:
@@ -968,7 +1030,9 @@ class ClipObjectCaptureSession(Node):
 
         image_rel = f"images/{self.sample_index:06d}.png"
         image_path = self.output_dir / image_rel
-        cv2.imwrite(str(image_path), observation.image)
+        if not cv2.imwrite(str(image_path), observation.image):
+            self.report_status(f"save failed: could not write {image_rel}", "warn")
+            return
         self.write_intrinsics(observation.camera_info)
 
         record = {
