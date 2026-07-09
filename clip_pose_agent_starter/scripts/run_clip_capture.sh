@@ -155,6 +155,8 @@ visible_actions="$(timeout 3 ros2 action list 2>/dev/null || true)"
 printf '%s\n' "${visible_actions}" | grep -E 'jparse|move|UR10|mur620' || true
 if ! printf '%s\n' "${visible_actions}" | grep -Fxq "${ACTION_NAME}"; then
   echo "[clip_capture] WARNING: action ${ACTION_NAME} is not currently visible"
+  echo "[clip_capture] hint: restart the MuR hardware from the MuR GUI so the integrated Cartesian move action is launched"
+  echo "[clip_capture] hint: do not start run_jparse_move_r_for_clip_capture.sh for the integrated-controller workflow"
 fi
 
 echo
