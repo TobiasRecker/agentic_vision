@@ -23,6 +23,7 @@ setup(
         "PyYAML>=6.0",
         "scipy>=1.10",
     ],
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="rosmatch",
     maintainer_email="rosmatch@example.com",

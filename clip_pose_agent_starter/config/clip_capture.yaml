@@ -27,6 +27,7 @@ clip_object_capture_session:
     click_window_radius: 4
     click_min_points: 8
     click_max_mad_m: 0.02
+    click_max_reprojection_error_px: 12.0
     allow_2d_center_fallback: true
     fallback_center_depth_m: 0.45
     samples: 18

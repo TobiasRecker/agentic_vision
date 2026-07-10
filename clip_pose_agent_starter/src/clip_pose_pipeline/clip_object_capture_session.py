@@ -32,6 +32,7 @@ from .capture_geometry import (
     estimate_anchor_from_xyz_image,
     generate_spiral_hemisphere_targets,
     invert_transform,
+    project_camera_point_to_pixel,
     quaternion_from_matrix,
     slew_vector,
     target_motion_metrics,
@@ -92,6 +93,7 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("click_window_radius", 4)
         self.declare_parameter("click_min_points", 8)
         self.declare_parameter("click_max_mad_m", 0.02)
+        self.declare_parameter("click_max_reprojection_error_px", 12.0)
         self.declare_parameter("allow_2d_center_fallback", True)
         self.declare_parameter("fallback_center_depth_m", 0.45)
         self.declare_parameter("samples", 18)
@@ -175,6 +177,13 @@ class ClipObjectCaptureSession(Node):
         self.camera_pose_records: list[dict[str, Any]] = []
         self.anchor_sample_records: list[dict[str, Any]] = []
         self.sample_index = 1
+        self.active_move_context: dict[str, Any] | None = None
+        self.active_goal_future: Any | None = None
+        self.active_goal_handle: Any | None = None
+        self.active_result_future: Any | None = None
+        self.active_cancel_future: Any | None = None
+        self.move_feedback_text = ""
+        self.quit_after_move = False
 
         self.write_metadata()
         self.get_logger().info(f"Writing clip capture session to {self.output_dir}")
@@ -289,12 +298,16 @@ class ClipObjectCaptureSession(Node):
         try:
             while rclpy.ok():
                 rclpy.spin_once(self, timeout_sec=0.0)
+                if self.quit_after_move and not self.move_active:
+                    break
                 cv2.imshow(self.window_name, self.render_gui_frame())
                 self.update_jog_output()
                 key = cv2.waitKeyEx(20)
                 if key != -1 and not self.handle_key(key):
                     break
         finally:
+            if self.move_active:
+                self.cancel_active_move("GUI closing")
             self.stop_jog(force=True)
             cv2.destroyWindow(self.window_name)
 
@@ -380,7 +393,10 @@ class ClipObjectCaptureSession(Node):
         cloud_text = "cloud: no"
         if self.latest_cloud_msg is not None:
             cloud_text = f"cloud: {self.latest_cloud_msg.width}x{self.latest_cloud_msg.height}"
-        target_text = "target: none" if self.gui_target is None else f"target: {self.gui_target_source}, press g"
+        if self.move_active:
+            target_text = self.move_feedback_text or "robot moving; press . to stop"
+        else:
+            target_text = "target: none" if self.gui_target is None else f"target: {self.gui_target_source}, press g"
         return [
             self.last_status,
             f"image: {image_shape[1]}x{image_shape[0]}  {cloud_text}",
@@ -405,6 +421,9 @@ class ClipObjectCaptureSession(Node):
         self.set_anchor_from_click(pixel)
 
     def set_anchor_from_click(self, pixel_uv: tuple[float, float]) -> None:
+        if self.move_active:
+            self.report_status("click blocked while robot is moving; press . to stop", "warn")
+            return
         self.clicked_pixel_uv = [float(pixel_uv[0]), float(pixel_uv[1])]
         self.target_cache = []
         self.target_cursor = 0
@@ -447,6 +466,27 @@ class ClipObjectCaptureSession(Node):
         if not estimate.valid or estimate.point_camera is None:
             self.report_status(f"anchor rejected: {estimate.reason}; quality={estimate.as_dict()}", "warn")
             return
+        quality = estimate.as_dict()
+        K = np.asarray(observation.camera_info.k, dtype=np.float64).reshape(3, 3)
+        try:
+            reprojected_pixel = project_camera_point_to_pixel(estimate.point_camera, K)
+        except ValueError as exc:
+            self.report_status(f"anchor rejected: {exc}; quality={quality}", "warn")
+            return
+        reprojection_error = float(np.linalg.norm(reprojected_pixel - np.asarray(pixel_uv)))
+        quality["reprojected_pixel_uv"] = reprojected_pixel.astype(float).tolist()
+        quality["reprojection_error_px"] = reprojection_error
+        max_reprojection_error = float(self.get_parameter("click_max_reprojection_error_px").value)
+        if reprojection_error > max_reprojection_error:
+            self.report_status(
+                "anchor rejected: pointcloud is not registered to clicked RGB pixel; "
+                f"reprojection_error={reprojection_error:.1f}px (max {max_reprojection_error:.1f}px); "
+                f"quality={quality}",
+                "warn",
+            )
+            return
+        if estimate.reason != "ok":
+            self.report_status(f"anchor accepted with degraded depth quality: {quality}", "warn")
 
         p_base_anchor = transform_point(observation.T_base_camera, estimate.point_camera)
         self.anchor = {
@@ -456,7 +496,7 @@ class ClipObjectCaptureSession(Node):
             "base_frame": self.param_str("robot_base_frame"),
             "p_camera_anchor": estimate.point_camera.astype(float).tolist(),
             "p_base_anchor": p_base_anchor.astype(float).tolist(),
-            "quality": estimate.as_dict(),
+            "quality": quality,
             "source": "manual_click_rgbd_pointcloud",
             "image_stamp": stamp_dict(observation.image_msg.header.stamp),
             "cloud_stamp": stamp_dict(observation.cloud_msg.header.stamp) if observation.cloud_msg is not None else None,
@@ -469,7 +509,8 @@ class ClipObjectCaptureSession(Node):
         self.gui_target_source = ""
         self.report_status(
             "anchor set: "
-            f"base=[{p_base_anchor[0]:.3f}, {p_base_anchor[1]:.3f}, {p_base_anchor[2]:.3f}]",
+            f"base=[{p_base_anchor[0]:.3f}, {p_base_anchor[1]:.3f}, {p_base_anchor[2]:.3f}], "
+            f"depth={estimate.point_camera[2]:.3f}m, reprojection={reprojection_error:.1f}px",
             "info",
         )
         self.write_anchors()
@@ -630,7 +671,7 @@ class ClipObjectCaptureSession(Node):
                 cloud_msg,
                 field_names=["x", "y", "z"],
                 skip_nans=False,
-                reshape_organized_cloud=True,
+                reshape_organized_cloud=False,
             )
         except Exception as exc:  # noqa: BLE001
             self.report_status(f"pointcloud decode failed: {exc}", "warn")
@@ -659,13 +700,23 @@ class ClipObjectCaptureSession(Node):
             self.get_logger().info(f"Capture GUI key: {self.last_key_text}")
 
         if char == "q" or key == 27:
+            if self.move_active:
+                self.quit_after_move = True
+                self.cancel_active_move("quit requested")
+                return True
             return False
         if char == "." or char == " ":
             self.stop_jog(force=True)
+            if self.move_active:
+                self.cancel_active_move("stop requested")
+                return True
             self.gui_target = None
             self.gui_target_anchor_base = None
             self.gui_target_source = ""
             self.report_status("stop requested; target cleared", "info")
+            return True
+        if self.move_active:
+            self.report_status("command blocked while robot is moving; press . to stop", "warn")
             return True
         if char == "m":
             self.rotation_jog_mode = not self.rotation_jog_mode
@@ -855,21 +906,15 @@ class ClipObjectCaptureSession(Node):
             if not self.target_is_safe(metrics):
                 return
         self.stop_jog(force=True)
-        success = self.send_pose_goal(self.gui_target)
-        self.target_history.append(
+        self.start_pose_goal(
+            self.gui_target,
             {
-                "event": "target_move",
-                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "kind": "target",
+                "label": f"target {self.gui_target_source}",
                 "source": self.gui_target_source,
-                "success": bool(success),
-            }
+                "clear_target_on_success": True,
+            },
         )
-        self.report_status("target move done" if success else "target move failed", "info" if success else "warn")
-        if success:
-            self.gui_target = None
-            self.gui_target_anchor_base = None
-            self.gui_target_source = ""
-        self.write_metadata()
 
     def go_to_initial_pose(self) -> None:
         if self.initial_T_base_tcp is None:
@@ -879,15 +924,29 @@ class ClipObjectCaptureSession(Node):
             self.report_status("back blocked: move_enabled is false", "warn")
             return
         self.stop_jog(force=True)
-        success = self.send_pose_goal(self.initial_T_base_tcp)
-        self.report_status("back to start done" if success else "back to start failed", "info" if success else "warn")
+        self.start_pose_goal(
+            self.initial_T_base_tcp,
+            {
+                "kind": "back",
+                "label": "back to start",
+                "source": "initial_pose",
+                "clear_target_on_success": False,
+            },
+        )
 
-    def send_pose_goal(self, T_base_tcp: np.ndarray) -> bool:
-        if self.action_client is None or JparseMove is None:
-            self.get_logger().error("JparseMove action type is not available in this environment.")
+    @property
+    def move_active(self) -> bool:
+        return self.active_move_context is not None
+
+    def start_pose_goal(self, T_base_tcp: np.ndarray, context: dict[str, Any]) -> bool:
+        if self.move_active:
+            self.report_status("move blocked: another robot move is active", "warn")
             return False
-        if not self.action_client.wait_for_server(timeout_sec=3.0):
-            self.get_logger().error(f"Action server not available: {self.param_str('action_name')}")
+        if self.action_client is None or JparseMove is None:
+            self.report_status("JparseMove action type is not available in this environment", "error")
+            return False
+        if not self.action_client.server_is_ready():
+            self.report_status(f"Action server not available: {self.param_str('action_name')}", "error")
             return False
 
         goal = JparseMove.Goal()
@@ -902,24 +961,140 @@ class ClipObjectCaptureSession(Node):
         goal.max_angular_velocity = float(self.get_parameter("max_angular_velocity").value)
         goal.timeout = float(self.get_parameter("move_timeout").value)
 
-        future = self.action_client.send_goal_async(goal)
-        self.wait_for_future(future)
-        goal_handle = future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().error("Move goal was rejected by the action server.")
+        self.active_move_context = {
+            **context,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "cancel_requested": False,
+        }
+        self.move_feedback_text = f"sending {context['label']}..."
+        try:
+            self.active_goal_future = self.action_client.send_goal_async(
+                goal,
+                feedback_callback=self.on_move_feedback,
+            )
+            self.active_goal_future.add_done_callback(self.on_move_goal_response)
+        except Exception as exc:  # noqa: BLE001
+            self.finish_active_move(False, f"could not send move goal: {exc}")
             return False
-        result_future = goal_handle.get_result_async()
-        self.wait_for_future(result_future)
-        result = result_future.result().result
+        self.report_status(f"{context['label']} requested; GUI remains active", "info")
+        return True
+
+    def on_move_goal_response(self, future: Any) -> None:
+        if not self.move_active:
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.finish_active_move(False, f"move goal response failed: {exc}")
+            return
+        self.active_goal_future = None
+        if goal_handle is None or not goal_handle.accepted:
+            self.finish_active_move(False, "move goal was rejected by the action server")
+            return
+        self.active_goal_handle = goal_handle
+        self.active_result_future = goal_handle.get_result_async()
+        self.active_result_future.add_done_callback(self.on_move_result)
+        label = str(self.active_move_context.get("label", "move"))
+        self.move_feedback_text = f"moving {label}; press . to stop"
+        self.report_status(f"{label} accepted; robot moving", "info")
+        if self.active_move_context.get("cancel_requested"):
+            self.request_goal_cancel()
+
+    def on_move_feedback(self, feedback_msg: Any) -> None:
+        if not self.move_active:
+            return
+        feedback = feedback_msg.feedback
+        label = str(self.active_move_context.get("label", "move"))
+        self.move_feedback_text = (
+            f"moving {label}: {float(feedback.progress) * 100.0:.0f}% "
+            f"pos={float(feedback.position_error):.3f}m; press . to stop"
+        )
+
+    def on_move_result(self, future: Any) -> None:
+        if not self.move_active:
+            return
+        try:
+            result_wrapper = future.result()
+            result = result_wrapper.result
+        except Exception as exc:  # noqa: BLE001
+            self.finish_active_move(False, f"move result failed: {exc}")
+            return
         self.get_logger().info(
             f"Move result: success={result.success}, message={result.message}, "
             f"pos_err={result.final_position_error:.4f}, ori_err={result.final_orientation_error:.4f}"
         )
-        return bool(result.success)
+        self.finish_active_move(bool(result.success), str(result.message))
 
-    def wait_for_future(self, future: Any) -> None:
-        while rclpy.ok() and not future.done():
-            rclpy.spin_once(self, timeout_sec=0.05)
+    def cancel_active_move(self, reason: str) -> None:
+        if not self.move_active:
+            return
+        self.active_move_context["cancel_requested"] = True
+        self.active_move_context["cancel_reason"] = reason
+        self.move_feedback_text = f"canceling move: {reason}..."
+        if self.active_goal_handle is None:
+            self.report_status(f"{reason}; canceling as soon as goal is accepted", "warn")
+            return
+        self.request_goal_cancel()
+
+    def request_goal_cancel(self) -> None:
+        if self.active_goal_handle is None or self.active_cancel_future is not None:
+            return
+        try:
+            self.active_cancel_future = self.active_goal_handle.cancel_goal_async()
+            self.active_cancel_future.add_done_callback(self.on_move_cancel_response)
+            self.report_status("move cancel requested", "warn")
+        except Exception as exc:  # noqa: BLE001
+            self.report_status(f"move cancel request failed: {exc}", "error")
+
+    def on_move_cancel_response(self, future: Any) -> None:
+        if not self.move_active:
+            return
+        try:
+            response = future.result()
+            accepted = bool(response.goals_canceling)
+        except Exception as exc:  # noqa: BLE001
+            self.report_status(f"move cancel response failed: {exc}", "error")
+            return
+        if accepted:
+            self.report_status("move cancel accepted; waiting for robot stop", "warn")
+        else:
+            self.report_status("move cancel was rejected", "error")
+
+    def finish_active_move(self, success: bool, message: str) -> None:
+        if not self.move_active:
+            return
+        context = self.active_move_context
+        canceled = bool(context.get("cancel_requested"))
+        if context.get("kind") == "target":
+            self.target_history.append(
+                {
+                    "event": "target_move",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "source": context.get("source", ""),
+                    "success": bool(success),
+                    "canceled": canceled,
+                    "message": message,
+                }
+            )
+        if success and context.get("clear_target_on_success"):
+            self.gui_target = None
+            self.gui_target_anchor_base = None
+            self.gui_target_source = ""
+
+        label = str(context.get("label", "move"))
+        self.active_move_context = None
+        self.active_goal_future = None
+        self.active_goal_handle = None
+        self.active_result_future = None
+        self.active_cancel_future = None
+        self.move_feedback_text = ""
+        if canceled:
+            self.report_status(f"{label} canceled: {message}", "warn")
+        elif success:
+            self.report_status(f"{label} done: {message}", "info")
+        else:
+            self.report_status(f"{label} failed: {message}", "warn")
+        self.write_metadata()
 
     def jog_command_from_key(self, key: int) -> tuple[np.ndarray | None, np.ndarray | None]:
         name = key_name(key)
@@ -1129,6 +1304,9 @@ class ClipObjectCaptureSession(Node):
                 "click_window_radius": int(self.get_parameter("click_window_radius").value),
                 "click_min_points": int(self.get_parameter("click_min_points").value),
                 "click_max_mad_m": float(self.get_parameter("click_max_mad_m").value),
+                "click_max_reprojection_error_px": float(
+                    self.get_parameter("click_max_reprojection_error_px").value
+                ),
                 "samples": int(self.get_parameter("samples").value),
                 "sphere_polar_span_deg": float(self.get_parameter("sphere_polar_span_deg").value),
                 "sphere_spiral_turns": float(self.get_parameter("sphere_spiral_turns").value),

@@ -16,6 +16,7 @@ from clip_pose_pipeline.capture_geometry import (  # noqa: E402
     estimate_anchor_from_xyz_image,
     generate_spiral_hemisphere_targets,
     invert_transform,
+    project_camera_point_to_pixel,
     target_motion_metrics,
     transform_from_translation_quaternion,
     transform_point,
@@ -45,6 +46,28 @@ def test_estimate_anchor_from_organized_pointcloud_window() -> None:
     assert estimate.samples_finite >= 8
 
 
+def test_estimate_anchor_accepts_degraded_noisy_depth_window() -> None:
+    xyz = np.zeros((20, 30, 3), dtype=np.float64)
+    xyz[:, :, 0] = 0.12
+    xyz[:, :, 1] = 0.05
+    xyz[:, :, 2] = 0.62
+    for offset, z_delta in enumerate(np.linspace(-0.10, 0.10, 9)):
+        xyz[6 + offset, 11:20, 2] += z_delta
+
+    estimate = estimate_anchor_from_xyz_image(
+        xyz,
+        (15, 10),
+        window_radius=4,
+        min_points=8,
+        max_mad_m=0.02,
+    )
+
+    assert estimate.valid
+    assert estimate.reason == "ok_noisy"
+    assert estimate.point_camera is not None
+    np.testing.assert_allclose(estimate.point_camera, [0.12, 0.05, 0.62], atol=0.02)
+
+
 def test_xyz_image_from_organized_points_keeps_native_layout() -> None:
     points = np.zeros((720, 1280, 3), dtype=np.float64)
     points[421, 704] = [0.1, -0.02, 0.42]
@@ -57,16 +80,26 @@ def test_xyz_image_from_organized_points_keeps_native_layout() -> None:
     np.testing.assert_allclose(xyz[421, 704], [0.1, -0.02, 0.42])
 
 
-def test_xyz_image_from_organized_points_transposes_driver_layout() -> None:
-    points = np.zeros((1280, 720, 3), dtype=np.float64)
-    points[704, 421] = [0.1, -0.02, 0.42]
+def test_xyz_image_from_organized_points_recovers_sensor_msgs_py_layout() -> None:
+    native = np.zeros((720, 1280, 3), dtype=np.float64)
+    native[421, 704] = [0.1, -0.02, 0.42]
+    points = native.reshape(1280, 720, 3)
 
     xyz, layout = xyz_image_from_organized_points(points, width=1280, height=720)
 
-    assert layout == "transposed"
+    assert layout == "width_height_reshape"
     assert xyz is not None
     assert xyz.shape == (720, 1280, 3)
     np.testing.assert_allclose(xyz[421, 704], [0.1, -0.02, 0.42])
+
+
+def test_project_camera_point_round_trips_pixel() -> None:
+    K = np.array([[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]])
+    point = np.array([0.04, -0.02, 0.5])
+
+    pixel = project_camera_point_to_pixel(point, K)
+
+    np.testing.assert_allclose(pixel, [712.0, 324.0])
 
 
 def test_xyz_image_from_organized_points_reshapes_flat_layout() -> None:

@@ -149,7 +149,15 @@ def xyz_image_from_organized_points(
         if arr.shape[:2] == expected:
             return np.asarray(arr[:, :, :3], dtype=np.float64), "native"
         if arr.shape[:2] == transposed:
-            return np.asarray(np.swapaxes(arr[:, :, :3], 0, 1), dtype=np.float64), "transposed"
+            # sensor_msgs_py in ROS 2 Jazzy reshapes the row-major PointCloud2
+            # buffer as (width, height). Recover the original linear ordering;
+            # swapping axes would associate XYZ values with the wrong pixels.
+            linear = np.asarray(arr[:, :, :3]).reshape(-1, 3)
+            normalized = np.asarray(
+                linear.reshape(expected[0], expected[1], 3),
+                dtype=np.float64,
+            )
+            return normalized, "width_height_reshape"
         return None, f"pointcloud has unexpected shape {arr.shape}"
 
     try:
@@ -227,6 +235,17 @@ def estimate_anchor_from_xyz_image(
     refined = np.median(inliers, axis=0)
     refined_mad = float(np.median(np.linalg.norm(inliers - refined, axis=1)))
     if refined_mad > float(max_mad_m):
+        noisy_accept_threshold = max(0.12, 6.0 * float(max_mad_m))
+        if refined_mad <= noisy_accept_threshold:
+            return AnchorEstimate(
+                True,
+                refined,
+                samples_total,
+                samples_finite,
+                samples_inlier,
+                refined_mad,
+                "ok_noisy",
+            )
         return AnchorEstimate(
             False,
             refined,
@@ -283,6 +302,17 @@ def camera_point_from_pixel(
         raise ValueError("Camera matrix has invalid focal length")
     z = float(depth_m)
     return np.array([(u - cx) * z / fx, (v - cy) * z / fy, z], dtype=np.float64)
+
+
+def project_camera_point_to_pixel(point_camera: np.ndarray, K: np.ndarray) -> np.ndarray:
+    x, y, z = np.asarray(point_camera, dtype=np.float64).reshape(3)
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    if not np.all(np.isfinite([x, y, z])) or z <= 1.0e-9:
+        raise ValueError("Camera point must have finite coordinates and positive depth")
+    return np.array(
+        [K[0, 0] * x / z + K[0, 2], K[1, 1] * y / z + K[1, 2]],
+        dtype=np.float64,
+    )
 
 
 def center_camera_target_from_pixel(
