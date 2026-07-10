@@ -44,6 +44,14 @@ def generate_launch_description():
         ],
     )
 
+    fullres_node = Node(
+        package="oak4_fullres_capture",
+        executable="oak4_fullres_capture_node",
+        name="oak_fullres_capture",
+        output="screen",
+        emulate_tty=True,
+    )
+
     return LaunchDescription(
         [
             DeclareLaunchArgument(
@@ -85,6 +93,7 @@ def generate_launch_description():
             DeclareLaunchArgument("samples", default_value="18"),
             DeclareLaunchArgument("allow_2d_center_fallback", default_value="true"),
             DeclareLaunchArgument("fallback_center_depth_m", default_value="0.45"),
+            fullres_node,
             capture_node,
         ]
     )

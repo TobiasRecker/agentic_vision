@@ -32,6 +32,8 @@ setup(
     entry_points={
         "console_scripts": [
             "clip_object_capture_session = clip_pose_pipeline.clip_object_capture_session:main",
+            "clip_hybrid_pipeline = clip_pose_pipeline.hybrid_cli:main",
+            "clip_pose_static_tf = clip_pose_pipeline.static_tf_publisher:main",
         ],
     },
 )

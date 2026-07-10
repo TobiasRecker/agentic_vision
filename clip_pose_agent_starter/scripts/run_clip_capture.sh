@@ -6,6 +6,7 @@ PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WS_DIR="$(cd "${PKG_DIR}/../../.." && pwd)"
 
 PACKAGE="clip_pose_agent_starter"
+FULLRES_PACKAGE="oak4_fullres_capture"
 LAUNCH_FILE="mur620_clip_capture.launch.py"
 ROBOT_NAME="${ROBOT_NAME:-mur620d}"
 
@@ -123,8 +124,8 @@ wait_for_camera_publishers() {
 }
 
 cd "${WS_DIR}"
-echo "[clip_capture] building ${PACKAGE}..."
-colcon build --packages-select "${PACKAGE}" --symlink-install
+echo "[clip_capture] building ${PACKAGE} and ${FULLRES_PACKAGE}..."
+colcon build --packages-select "${PACKAGE}" "${FULLRES_PACKAGE}" --symlink-install
 
 echo
 echo "[clip_capture] sourcing install/setup.bash..."
@@ -135,6 +136,7 @@ set -u
 echo
 echo "[clip_capture] installed executables:"
 ros2 pkg executables "${PACKAGE}" || true
+ros2 pkg executables "${FULLRES_PACKAGE}" || true
 
 echo
 echo "[clip_capture] currently visible relevant topics:"

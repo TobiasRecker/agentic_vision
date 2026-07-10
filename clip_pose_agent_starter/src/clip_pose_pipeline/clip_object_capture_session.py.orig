@@ -645,34 +645,7 @@ class ClipObjectCaptureSession(Node):
 
         self._focus_request_serial += 1
         serial = self._focus_request_serial
-        request = self.focus_param_client.get_parameter_types(["rgb.r_focus"])
-        request.add_done_callback(
-            lambda done: self.set_focus_after_type_check(done, serial, position, depth_m)
-        )
-
-    def set_focus_after_type_check(
-        self,
-        future: Any,
-        serial: int,
-        position: int,
-        depth_m: float,
-    ) -> None:
-        if serial != self._focus_request_serial:
-            return
-        try:
-            response = future.result()
-            focus_type = None if response is None or not response.types else response.types[0]
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(f"Could not query OAK focus support: {exc}")
-            return
-        if focus_type != Parameter.Type.INTEGER.value:
-            self.get_logger().warn(
-                "Click focus unavailable: the running OAK driver does not expose integer "
-                "parameter rgb.r_focus; leaving the current focus unchanged"
-            )
-            return
-
-        request = self.focus_param_client.set_parameters_atomically(
+        request = self.focus_param_client.set_parameters(
             [
                 Parameter("rgb.r_set_man_focus", value=True),
                 Parameter("rgb.r_focus", value=position),
@@ -686,15 +659,16 @@ class ClipObjectCaptureSession(Node):
         if serial != self._focus_request_serial:
             return
         try:
-            response = future.result()
-            result = None if response is None else response.result
-            if result is not None and result.successful:
+            results = future.result()
+            if results and all(result.successful for result in results):
                 self.get_logger().info(
                     f"Depth focus set to lens position {position} for {depth_m:.3f}m"
                 )
                 return
-            reason = (
-                "no response" if result is None else result.reason or "parameter rejected"
+            reason = "no response" if not results else "; ".join(
+                result.reason or "parameter rejected"
+                for result in results
+                if not result.successful
             )
         except Exception as exc:  # noqa: BLE001
             reason = str(exc)
@@ -1441,13 +1415,6 @@ class ClipObjectCaptureSession(Node):
         if self.capture_active:
             self.report_status("full-resolution capture already active", "warn")
             return
-        if not self.param_bool("fullres_hardware_enabled"):
-            self.report_status(
-                "save blocked: direct OAK full-resolution pipeline is disabled after reproducible firmware crashes; "
-                "keep false until the Luxonis Camera pipeline is validated",
-                "error",
-            )
-            return
         if not self.fullres_capture_client.service_is_ready():
             self.report_status(
                 f"save blocked: full-resolution service {self.param_str('fullres_capture_service')} is unavailable",
@@ -1475,13 +1442,11 @@ class ClipObjectCaptureSession(Node):
         focus_position = self.fullres_focus_position(depth_m)
         image_rel = f"images/{self.sample_index:06d}.{image_format}"
         image_path = self.output_dir / image_rel
-        roi_path = self.output_dir / "roi" / f"{self.sample_index:06d}.png"
         self.active_capture_context = {
             "status": "preparing 48 MP capture...",
             "observation": observation,
             "image_rel": image_rel,
             "image_path": image_path,
-            "roi_path": roi_path,
             "sidecar_path": Path(str(image_path) + ".camera_info.yaml"),
             "fullres_pixel_uv": full_pixel.astype(float).tolist(),
             "focus_roi_xywh": [int(value) for value in roi],
@@ -1532,9 +1497,7 @@ class ClipObjectCaptureSession(Node):
         roi_x, roi_y, roi_width, roi_height = context["focus_roi_xywh"]
         context["status"] = "configuring autofocus ROI..."
         parameters = [
-            Parameter("enable_device_capture", value=self.param_bool("fullres_hardware_enabled")),
             Parameter("output_path", value=str(context["image_path"])),
-            Parameter("roi_output_path", value=str(context["roi_path"])),
             Parameter("capture_width", value=int(context["capture_width"])),
             Parameter("capture_height", value=int(context["capture_height"])),
             Parameter("focus_mode", value=str(context["focus_mode"])),
@@ -1677,12 +1640,16 @@ class ClipObjectCaptureSession(Node):
         self.verify_capture_pose_static(observation)
         sample_id = f"{self.sample_index:06d}"
         roi_x, roi_y, roi_width, roi_height = (int(value) for value in context["focus_roi_xywh"])
-        roi_path: Path = context["roi_path"]
-        roi_image = cv2.imread(str(roi_path), cv2.IMREAD_UNCHANGED)
-        if roi_image is None or roi_image.shape[:2] != (roi_height, roi_width):
-            raise RuntimeError(
-                f"full-resolution service did not create the expected lossless ROI {roi_path}"
-            )
+        full_image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if full_image is None:
+            raise RuntimeError(f"could not decode saved full-resolution image {image_path}")
+        roi_path = self.output_dir / "roi" / f"{sample_id}.png"
+        roi_path.parent.mkdir(parents=True, exist_ok=True)
+        roi_image = full_image[roi_y : roi_y + roi_height, roi_x : roi_x + roi_width]
+        if roi_image.size == 0 or not cv2.imwrite(
+            str(roi_path), roi_image, [cv2.IMWRITE_PNG_COMPRESSION, 6]
+        ):
+            raise RuntimeError(f"could not write lossless ROI {roi_path}")
 
         xyz = self.pointcloud_xyz_image(observation.cloud_msg)
         if xyz is None:
@@ -1927,7 +1894,6 @@ class ClipObjectCaptureSession(Node):
                 ),
                 "fullres_enabled": self.param_bool("fullres_enabled"),
                 "fullres_required": self.param_bool("fullres_required"),
-                "fullres_hardware_enabled": self.param_bool("fullres_hardware_enabled"),
                 "fullres_size": [
                     int(self.get_parameter("fullres_width").value),
                     int(self.get_parameter("fullres_height").value),
@@ -1945,12 +1911,6 @@ class ClipObjectCaptureSession(Node):
                     int(self.get_parameter("fullres_fallback_width").value),
                     int(self.get_parameter("fullres_fallback_height").value),
                 ],
-                "capture_pose_max_translation_m": float(
-                    self.get_parameter("capture_pose_max_translation_m").value
-                ),
-                "capture_pose_max_rotation_deg": float(
-                    self.get_parameter("capture_pose_max_rotation_deg").value
-                ),
                 "samples": int(self.get_parameter("samples").value),
                 "sphere_polar_span_deg": float(self.get_parameter("sphere_polar_span_deg").value),
                 "sphere_spiral_turns": float(self.get_parameter("sphere_spiral_turns").value),

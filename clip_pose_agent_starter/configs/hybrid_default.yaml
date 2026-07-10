@@ -1,0 +1,22 @@
+minimum_views: 6
+minimum_keypoint_views: 4
+plane_threshold_m: 0.002
+plane_max_rms_m: 0.002
+clip_min_plane_distance_m: 0.001
+clip_max_plane_distance_m: 0.060
+depth_stride: 2
+voxel_size_m: 0.0005
+outlier_neighbors: 12
+outlier_std_ratio: 2.5
+hull_bounds_clip_m:
+  - [-0.04, 0.04]
+  - [-0.04, 0.04]
+  - [-0.005, 0.05]
+hull_voxel_size_m: 0.0005
+hull_min_views: 3
+hull_inside_fraction: 0.8
+max_reprojection_rmse_px_1280: 3.0
+max_split_translation_m: 0.003
+max_split_rotation_deg: 2.0
+max_leave_one_out_origin_m: 0.003
+minimum_heldout_mask_iou: 0.70

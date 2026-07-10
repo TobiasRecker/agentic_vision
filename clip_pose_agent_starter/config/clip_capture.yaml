@@ -28,6 +28,32 @@ clip_object_capture_session:
     click_min_points: 8
     click_max_mad_m: 0.02
     click_max_reprojection_error_px: 12.0
+    focus_on_click: true
+    focus_camera_node: /oak
+    focus_infinity_position: 125
+    focus_macro_position: 255
+    focus_macro_distance_m: 0.08
+    fullres_enabled: true
+    fullres_required: true
+    fullres_hardware_enabled: false
+    fullres_camera_node: /oak_fullres_capture
+    fullres_capture_service: /oak_fullres_capture/capture
+    oak_stop_service: /oak/stop_driver
+    oak_start_service: /oak/start_driver
+    fullres_width: 8000
+    fullres_height: 6000
+    fullres_format: jpg
+    fullres_jpeg_quality: 97
+    fullres_png_compression: 3
+    fullres_focus_mode: auto_roi
+    fullres_focus_roi_size_px: 800
+    fullres_focus_settle_sec: 1.0
+    fullres_frame_timeout_sec: 12.0
+    capture_pose_max_translation_m: 0.0005
+    capture_pose_max_rotation_deg: 0.2
+    fullres_allow_fallback: false
+    fullres_fallback_width: 4000
+    fullres_fallback_height: 3000
     allow_2d_center_fallback: true
     fallback_center_depth_m: 0.45
     samples: 18

@@ -17,9 +17,7 @@ from clip_pose_pipeline.capture_geometry import (  # noqa: E402
     estimate_anchor_from_xyz_image,
     generate_spiral_hemisphere_targets,
     invert_transform,
-    lens_position_for_depth,
     map_pixel_center_crop,
-    map_pixel_from_center_crop,
     project_camera_point_to_pixel,
     source_camera_matrix_from_center_crop,
     target_motion_metrics,
@@ -35,19 +33,6 @@ def test_center_crop_maps_full_sensor_pixel_to_16_by_9_depth_pixel() -> None:
 
     top_of_depth_crop = map_pixel_center_crop((4000.0, 750.0), (8000, 6000), (1280, 720))
     np.testing.assert_allclose(top_of_depth_crop, [640.0, 0.0])
-
-
-def test_center_crop_inverse_recovers_full_sensor_pixel() -> None:
-    full_pixel = np.array([6123.5, 2810.25])
-    preview_pixel = map_pixel_center_crop(full_pixel, (8000, 6000), (1280, 720))
-    recovered = map_pixel_from_center_crop(preview_pixel, (8000, 6000), (1280, 720))
-    np.testing.assert_allclose(recovered, full_pixel)
-
-
-def test_lens_position_for_depth_matches_oak_vcm_endpoints() -> None:
-    assert lens_position_for_depth(0.08) == 255
-    assert lens_position_for_depth(0.40) == 151
-    assert lens_position_for_depth(1000.0) == 125
 
 
 def test_center_crop_recovers_full_resolution_intrinsics() -> None:

@@ -52,3 +52,21 @@ keypoints:
   back_left: [-0.0125, 0.0000, -0.0180]
   back_right: [0.0125, 0.0000, -0.0180]
 ```
+
+## Hybrid capture artifacts
+
+Full-resolution hybrid sessions additionally store matching sample IDs:
+
+```text
+images/000001.jpg               # full RGB, JPEG quality 97
+roi/000001.png                  # lossless object ROI
+depth/000001.png                # uint16 depth in millimeters; zero is invalid
+depth/000001.yaml               # depth K, pose, frame, and source timestamps
+hybrid/masks/000001.png         # uint8 ROI mask
+hybrid/annotations.json         # full-image functional keypoints
+hybrid/manifest.json            # normalized read-only session index
+```
+
+`annotations.json` stores `left_lip`, `right_lip`, and `seat_center` in full-resolution image
+coordinates. `roi_xywh` maps each ROI mask back into that image. RGB distortion coefficients are
+kept in the manifest and must be applied for triangulation and visual-hull projection.
