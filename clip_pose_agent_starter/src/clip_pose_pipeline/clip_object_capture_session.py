@@ -133,6 +133,11 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("fullres_allow_fallback", False)
         self.declare_parameter("fullres_fallback_width", 4000)
         self.declare_parameter("fullres_fallback_height", 3000)
+        self.declare_parameter("ros_stream_fallback_enabled", True)
+        self.declare_parameter("ros_stream_min_width", 3840)
+        self.declare_parameter("ros_stream_min_height", 2160)
+        self.declare_parameter("ros_stream_format", "jpg")
+        self.declare_parameter("ros_stream_jpeg_quality", 97)
         self.declare_parameter("capture_pose_max_translation_m", 0.0005)
         self.declare_parameter("capture_pose_max_rotation_deg", 0.2)
         self.declare_parameter("allow_2d_center_fallback", True)
@@ -2001,6 +2006,13 @@ class ClipObjectCaptureSession(Node):
             "depth_image_size": [depth_size[0], depth_size[1]],
             "K_depth": K_depth.tolist(),
         }
+        record["pose_json"] = self.write_sample_pose_sidecar(
+            sample_id,
+            context["image_rel"],
+            observation,
+            capture_stamp,
+            capture_mode,
+        )
         self.camera_pose_records.append(record)
 
         anchor_base = np.asarray(self.anchor["p_base_anchor"], dtype=np.float64)
@@ -2089,18 +2101,56 @@ class ClipObjectCaptureSession(Node):
         observation = self.current_observation(require_cloud=False)
         if observation is None:
             return
-        if self.param_bool("fullres_enabled"):
+        if self.param_bool("fullres_enabled") and self.param_bool("fullres_hardware_enabled"):
             self.start_fullres_capture(observation)
             return
+        if self.param_bool("ros_stream_fallback_enabled"):
+            self.save_ros_stream_sample(observation)
+            return
         if self.param_bool("fullres_required"):
-            self.report_status("save blocked: full-resolution capture is required but disabled", "error")
+            self.report_status(
+                "save blocked: full-resolution capture is required, direct OAK capture is disabled, "
+                "and the ROS stream fallback is disabled",
+                "error",
+            )
             return
 
-        image_rel = f"images/{self.sample_index:06d}.png"
-        image_path = self.output_dir / image_rel
-        if not cv2.imwrite(str(image_path), observation.image):
-            self.report_status(f"save failed: could not write {image_rel}", "warn")
+        self.save_ros_stream_sample(observation, enforce_minimum_size=False)
+
+    def save_ros_stream_sample(
+        self,
+        observation: Observation,
+        enforce_minimum_size: bool = True,
+    ) -> None:
+        image_height, image_width = observation.image.shape[:2]
+        minimum_width = int(self.get_parameter("ros_stream_min_width").value)
+        minimum_height = int(self.get_parameter("ros_stream_min_height").value)
+        if enforce_minimum_size and (image_width < minimum_width or image_height < minimum_height):
+            self.report_status(
+                "save blocked: ROS image stream is only "
+                f"{image_width}x{image_height}; select RGB {minimum_width}x{minimum_height} "
+                "in OAK Settings and restart OAK",
+                "error",
+            )
             return
+        info_size = (int(observation.camera_info.width), int(observation.camera_info.height))
+        if info_size != (image_width, image_height):
+            self.report_status(
+                "save blocked: waiting for CameraInfo matching the current RGB stream; "
+                f"image={image_width}x{image_height}, info={info_size[0]}x{info_size[1]}",
+                "warn",
+            )
+            return
+
+        image_format = self.param_str("ros_stream_format").strip().lower()
+        if image_format == "jpeg":
+            image_format = "jpg"
+        if image_format not in ("jpg", "png"):
+            self.report_status("save blocked: ros_stream_format must be jpg, jpeg, or png", "error")
+            return
+
+        image_rel = f"images/{self.sample_index:06d}.{image_format}"
+        image_path = self.output_dir / image_rel
         anchor_pixel = self.anchor_pixel_for_observation(observation)
         self.ensure_default_roi(anchor_pixel, observation.image.shape[:2])
         roi = self.preview_roi_xywh(observation.image.shape[:2], anchor_pixel)
@@ -2115,6 +2165,28 @@ class ClipObjectCaptureSession(Node):
         if not cv2.imwrite(str(roi_path), roi_image):
             self.report_status(f"save failed: could not write {roi_rel}", "warn")
             return
+
+        compressed_passthrough = (
+            image_format == "jpg"
+            and isinstance(observation.image_msg, CompressedImage)
+            and "jpeg" in observation.image_msg.format.lower()
+        )
+        if compressed_passthrough:
+            try:
+                image_path.write_bytes(bytes(observation.image_msg.data))
+            except OSError as exc:
+                self.report_status(f"save failed: could not write {image_rel}: {exc}", "warn")
+                return
+        else:
+            options: list[int] = []
+            if image_format == "jpg":
+                options = [
+                    cv2.IMWRITE_JPEG_QUALITY,
+                    int(np.clip(self.get_parameter("ros_stream_jpeg_quality").value, 1, 100)),
+                ]
+            if not cv2.imwrite(str(image_path), observation.image, options):
+                self.report_status(f"save failed: could not write {image_rel}", "warn")
+                return
         self.write_intrinsics(observation.camera_info)
 
         record = {
@@ -2124,13 +2196,22 @@ class ClipObjectCaptureSession(Node):
             "camera_frame": observation.camera_frame,
             "T_base_camera": matrix_to_list(observation.T_base_camera),
             "T_base_tcp": matrix_to_list(observation.T_base_tcp),
-            "capture_mode": "preview_explicit",
+            "capture_mode": "ros_stream_4k" if enforce_minimum_size else "preview_explicit",
             "image_size": [int(observation.image.shape[1]), int(observation.image.shape[0])],
+            "compressed_passthrough": compressed_passthrough,
             "preview_pixel_uv": anchor_pixel.astype(float).tolist(),
             "preview_roi_xywh": [int(value) for value in roi],
             "rgb_roi": roi_rel,
             "roi_xywh_full": [int(value) for value in roi],
         }
+        sample_id = f"{self.sample_index:06d}"
+        record["pose_json"] = self.write_sample_pose_sidecar(
+            sample_id,
+            image_rel,
+            observation,
+            observation.image_msg.header.stamp,
+            record["capture_mode"],
+        )
         self.camera_pose_records.append(record)
 
         anchor_base = np.asarray(self.anchor["p_base_anchor"], dtype=np.float64)
@@ -2147,7 +2228,7 @@ class ClipObjectCaptureSession(Node):
         self.write_camera_poses()
         self.write_anchors()
         self.write_metadata()
-        self.last_status = f"saved {image_rel}"
+        self.last_status = f"saved {image_rel} ({image_width}x{image_height})"
         self.get_logger().info(self.last_status)
 
     def write_intrinsics(self, msg: CameraInfo) -> None:
@@ -2159,6 +2240,50 @@ class ClipObjectCaptureSession(Node):
             "distortion": [float(value) for value in msg.d],
         }
         write_yaml(self.output_dir / "intrinsics.yaml", data)
+
+    def write_sample_pose_sidecar(
+        self,
+        sample_id: str,
+        image_rel: str,
+        observation: Observation,
+        capture_stamp: Any,
+        capture_mode: str,
+    ) -> str:
+        pose_rel = f"poses/{sample_id}.json"
+        T_base_camera = np.asarray(observation.T_base_camera, dtype=np.float64)
+        T_base_tcp = np.asarray(observation.T_base_tcp, dtype=np.float64)
+        write_json(
+            self.output_dir / pose_rel,
+            {
+                "version": 1,
+                "sample_id": sample_id,
+                "image": image_rel,
+                "capture_mode": capture_mode,
+                "capture_stamp": stamp_dict(capture_stamp),
+                "pose_reference_image_stamp": stamp_dict(observation.image_msg.header.stamp),
+                "convention": "p_base = T_base_camera @ p_camera",
+                "frames": {
+                    "base": self.param_str("robot_base_frame"),
+                    "camera": observation.camera_frame,
+                    "tcp": self.param_str("robot_tcp_frame"),
+                },
+                "camera_pose": {
+                    "T_base_camera": matrix_to_list(T_base_camera),
+                    "translation_m": T_base_camera[:3, 3].astype(float).tolist(),
+                    "quaternion_xyzw": quaternion_from_matrix(T_base_camera[:3, :3])
+                    .astype(float)
+                    .tolist(),
+                },
+                "tcp_pose": {
+                    "T_base_tcp": matrix_to_list(T_base_tcp),
+                    "translation_m": T_base_tcp[:3, 3].astype(float).tolist(),
+                    "quaternion_xyzw": quaternion_from_matrix(T_base_tcp[:3, :3])
+                    .astype(float)
+                    .tolist(),
+                },
+            },
+        )
+        return pose_rel
 
     def write_camera_poses(self) -> None:
         write_json(
@@ -2247,6 +2372,17 @@ class ClipObjectCaptureSession(Node):
                     int(self.get_parameter("fullres_fallback_width").value),
                     int(self.get_parameter("fullres_fallback_height").value),
                 ],
+                "ros_stream_fallback_enabled": self.param_bool(
+                    "ros_stream_fallback_enabled"
+                ),
+                "ros_stream_min_size": [
+                    int(self.get_parameter("ros_stream_min_width").value),
+                    int(self.get_parameter("ros_stream_min_height").value),
+                ],
+                "ros_stream_format": self.param_str("ros_stream_format"),
+                "ros_stream_jpeg_quality": int(
+                    self.get_parameter("ros_stream_jpeg_quality").value
+                ),
                 "capture_pose_max_translation_m": float(
                     self.get_parameter("capture_pose_max_translation_m").value
                 ),

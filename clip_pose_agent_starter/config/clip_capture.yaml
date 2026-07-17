@@ -58,6 +58,11 @@ clip_object_capture_session:
     fullres_allow_fallback: false
     fullres_fallback_width: 4000
     fullres_fallback_height: 3000
+    ros_stream_fallback_enabled: true
+    ros_stream_min_width: 3840
+    ros_stream_min_height: 2160
+    ros_stream_format: jpg
+    ros_stream_jpeg_quality: 97
     allow_2d_center_fallback: true
     fallback_center_depth_m: 0.45
     samples: 18

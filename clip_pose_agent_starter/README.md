@@ -61,6 +61,17 @@ an updated Luxonis stack. To explicitly return to preview-only capture, set both
 `fullres_enabled: false` and `fullres_required: false`; resulting samples are marked
 `preview_explicit`.
 
+As a temporary 4K path, the capture node can save the running ROS RGB stream. First set the
+anchor while OAK is in `RGBD + PointCloud` mode. Then switch OAK Settings to `RGB`,
+`3840x2160 @ 5 Hz`, compressed, with a high transport quality and restart OAK. The capture node
+keeps the anchor. Pressing `c` writes the original JPEG payload without recompression, a lossless
+ROI PNG, intrinsics, and the current camera pose. Images below 3840x2160 are rejected explicitly
+while `ros_stream_fallback_enabled` is active.
+
+Each accepted image also gets a matching `poses/000001.json` sidecar. It contains
+`T_base_camera`, translation/quaternion, the TCP pose, frame names, and timestamps. The aggregate
+`camera_poses.json` references the sidecar through `pose_json`.
+
 ## Hybrid clip reconstruction
 
 The hybrid pipeline estimates a functional clip task frame without CAD. It combines manually
