@@ -14,12 +14,15 @@ from clip_pose_pipeline.capture_geometry import (  # noqa: E402
     center_crop_affine,
     center_camera_target_from_pixel,
     center_camera_target,
+    clamp_roi_xywh,
     estimate_anchor_from_xyz_image,
+    estimate_anchor_from_xyz_image_expanding,
     generate_spiral_hemisphere_targets,
     invert_transform,
     lens_position_for_depth,
     map_pixel_center_crop,
     map_pixel_from_center_crop,
+    map_roi_from_center_crop,
     project_camera_point_to_pixel,
     source_camera_matrix_from_center_crop,
     target_motion_metrics,
@@ -42,6 +45,16 @@ def test_center_crop_inverse_recovers_full_sensor_pixel() -> None:
     preview_pixel = map_pixel_center_crop(full_pixel, (8000, 6000), (1280, 720))
     recovered = map_pixel_from_center_crop(preview_pixel, (8000, 6000), (1280, 720))
     np.testing.assert_allclose(recovered, full_pixel)
+
+
+def test_roi_maps_from_preview_to_full_sensor_crop() -> None:
+    mapped = map_roi_from_center_crop((540, 260, 200, 200), (8000, 6000), (1280, 720))
+
+    assert mapped == (3375, 2375, 1250, 1250)
+
+
+def test_roi_clamping_preserves_size_at_image_edge() -> None:
+    assert clamp_roi_xywh((-20, 470, 160, 100), (640, 480)) == (0, 380, 160, 100)
 
 
 def test_lens_position_for_depth_matches_oak_vcm_endpoints() -> None:
@@ -104,6 +117,30 @@ def test_estimate_anchor_accepts_degraded_noisy_depth_window() -> None:
     assert estimate.reason == "ok_noisy"
     assert estimate.point_camera is not None
     np.testing.assert_allclose(estimate.point_camera, [0.12, 0.05, 0.62], atol=0.02)
+
+
+def test_expanding_anchor_search_recovers_depth_hole() -> None:
+    height, width = 80, 100
+    yy, xx = np.mgrid[:height, :width]
+    xyz = np.empty((height, width, 3), dtype=np.float64)
+    xyz[:, :, 0] = (xx - 50.0) * 0.001
+    xyz[:, :, 1] = (yy - 40.0) * 0.001
+    xyz[:, :, 2] = 0.48
+    xyz[29:52, 39:62] = np.nan
+
+    estimate, radius = estimate_anchor_from_xyz_image_expanding(
+        xyz,
+        (50, 40),
+        window_radius=4,
+        max_window_radius=24,
+        radius_step=4,
+        min_points=8,
+    )
+
+    assert estimate.valid
+    assert radius == 12
+    assert estimate.point_camera is not None
+    assert abs(estimate.point_camera[2] - 0.48) < 1.0e-6
 
 
 def test_xyz_image_from_organized_points_keeps_native_layout() -> None:

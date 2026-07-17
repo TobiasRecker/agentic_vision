@@ -21,6 +21,11 @@ ros2 launch clip_pose_agent_starter mur620_clip_capture.launch.py
 
 The capture GUI writes RGB images, intrinsics, `T_base_camera`, and the clicked RGBD anchor to `~/clip_pose_sessions/<timestamp>/`.
 
+The first anchor click also creates a visible default object ROI. Press `r`, then drag a new
+rectangle in the live image to adjust it. The ROI is retained for the session and follows the
+projected 3D anchor in later views. Every sample records the effective ROI coordinates and saves
+the crop losslessly below `roi/`.
+
 Convenience runner with build, source, launch, and logging:
 
 ```bash
@@ -37,8 +42,8 @@ IMAGE_TOPIC=/oak/rgb/image_raw IMAGE_COMPRESSED=false MOVE_ENABLED=true \
 ### Full-resolution capture and focus
 
 The launch file also starts the idle `oak4_fullres_capture` helper. Pressing `c` freezes the
-current RGB-D observation and robot pose, maps the clicked preview pixel into the full sensor
-image, and configures an autofocus ROI around it. The requested photo, its full-resolution
+current RGB-D observation and robot pose, maps the tracked preview ROI into the full sensor
+image, and uses it as the autofocus ROI. The requested photo, its full-resolution
 intrinsics, the RGB ROI, and the synchronized depth artifact are committed only when every
 required file has been validated. Manual focus is available through `fullres_focus_mode: manual`;
 the requested lens position is estimated from the clicked point's camera-frame depth.

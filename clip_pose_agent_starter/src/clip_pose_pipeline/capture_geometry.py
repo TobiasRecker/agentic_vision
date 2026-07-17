@@ -180,6 +180,47 @@ def map_pixel_from_center_crop(
     return mapped[:2]
 
 
+def clamp_roi_xywh(
+    roi_xywh: tuple[float, float, float, float] | list[float] | np.ndarray,
+    image_size: tuple[int, int],
+    min_size_px: int = 1,
+) -> tuple[int, int, int, int]:
+    """Clamp an x/y/width/height ROI while preserving as much size as possible."""
+    image_width, image_height = (int(value) for value in image_size)
+    if min(image_width, image_height) <= 0:
+        raise ValueError("image dimensions must be positive")
+    x, y, width, height = np.asarray(roi_xywh, dtype=np.float64).reshape(4)
+    if not np.all(np.isfinite([x, y, width, height])):
+        raise ValueError("ROI values must be finite")
+
+    minimum = max(1, int(min_size_px))
+    roi_width = min(image_width, max(minimum, int(round(width))))
+    roi_height = min(image_height, max(minimum, int(round(height))))
+    roi_x = int(np.clip(round(x), 0, image_width - roi_width))
+    roi_y = int(np.clip(round(y), 0, image_height - roi_height))
+    return roi_x, roi_y, roi_width, roi_height
+
+
+def map_roi_from_center_crop(
+    roi_xywh: tuple[float, float, float, float] | list[float] | np.ndarray,
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Map a ROI from a centered-crop target image back into its source image."""
+    x, y, width, height = np.asarray(roi_xywh, dtype=np.float64).reshape(4)
+    top_left = map_pixel_from_center_crop((x, y), source_size, target_size)
+    bottom_right = map_pixel_from_center_crop(
+        (x + width, y + height), source_size, target_size
+    )
+    mapped = (
+        float(np.floor(top_left[0])),
+        float(np.floor(top_left[1])),
+        float(np.ceil(bottom_right[0]) - np.floor(top_left[0])),
+        float(np.ceil(bottom_right[1]) - np.floor(top_left[1])),
+    )
+    return clamp_roi_xywh(mapped, source_size)
+
+
 def lens_position_for_depth(
     depth_m: float,
     infinity_position: int = 125,
@@ -342,6 +383,40 @@ def estimate_anchor_from_xyz_image(
         refined_mad,
         "ok",
     )
+
+
+def estimate_anchor_from_xyz_image_expanding(
+    xyz_image: np.ndarray,
+    pixel_uv: tuple[float, float] | list[float] | np.ndarray,
+    window_radius: int = 4,
+    max_window_radius: int = 120,
+    radius_step: int = 8,
+    min_points: int = 8,
+    max_mad_m: float = 0.02,
+) -> tuple[AnchorEstimate, int]:
+    """Expand around a depth hole until a locally consistent surface is available."""
+    initial_radius = max(0, int(window_radius))
+    maximum_radius = max(initial_radius, int(max_window_radius))
+    step = max(1, int(radius_step))
+    radii = list(range(initial_radius, maximum_radius + 1, step))
+    if not radii or radii[-1] != maximum_radius:
+        radii.append(maximum_radius)
+
+    last_estimate: AnchorEstimate | None = None
+    for radius in radii:
+        estimate = estimate_anchor_from_xyz_image(
+            xyz_image,
+            pixel_uv,
+            window_radius=radius,
+            min_points=min_points,
+            max_mad_m=max_mad_m,
+        )
+        last_estimate = estimate
+        if estimate.valid:
+            return estimate, radius
+
+    assert last_estimate is not None
+    return last_estimate, maximum_radius
 
 
 def center_camera_target(

@@ -25,6 +25,8 @@ clip_object_capture_session:
     jog_frame: UR10_r/base_link
 
     click_window_radius: 4
+    click_hole_search_max_radius: 120
+    click_hole_search_step: 8
     click_min_points: 8
     click_max_mad_m: 0.02
     click_max_reprojection_error_px: 12.0
@@ -47,6 +49,8 @@ clip_object_capture_session:
     fullres_png_compression: 3
     fullres_focus_mode: auto_roi
     fullres_focus_roi_size_px: 800
+    roi_default_size_fraction: 0.35
+    roi_min_size_px: 24
     fullres_focus_settle_sec: 1.0
     fullres_frame_timeout_sec: 12.0
     capture_pose_max_translation_m: 0.0005

@@ -17,7 +17,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from rclpy.action import ActionClient
 from rclpy.parameter import Parameter
-from rclpy.parameter_client import AsyncParametersClient
+from rclpy.parameter_client import AsyncParameterClient
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -32,14 +32,16 @@ from .capture_geometry import (
     camera_point_from_pixel,
     center_crop_affine,
     center_camera_target,
+    clamp_roi_xywh,
     lens_position_for_depth,
     center_camera_target_from_pixel,
-    estimate_anchor_from_xyz_image,
+    estimate_anchor_from_xyz_image_expanding,
     generate_spiral_hemisphere_targets,
     invert_transform,
     map_pixel_center_crop,
     project_camera_point_to_pixel,
     map_pixel_from_center_crop,
+    map_roi_from_center_crop,
     quaternion_from_matrix,
     rotation_angle_deg,
     slew_vector,
@@ -100,6 +102,8 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("jog_hold_timeout", 0.8)
         self.declare_parameter("display_max_side", 1600)
         self.declare_parameter("click_window_radius", 4)
+        self.declare_parameter("click_hole_search_max_radius", 120)
+        self.declare_parameter("click_hole_search_step", 8)
         self.declare_parameter("click_min_points", 8)
         self.declare_parameter("click_max_mad_m", 0.02)
         self.declare_parameter("click_max_reprojection_error_px", 12.0)
@@ -122,6 +126,8 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("fullres_png_compression", 3)
         self.declare_parameter("fullres_focus_mode", "auto_roi")
         self.declare_parameter("fullres_focus_roi_size_px", 800)
+        self.declare_parameter("roi_default_size_fraction", 0.35)
+        self.declare_parameter("roi_min_size_px", 24)
         self.declare_parameter("fullres_focus_settle_sec", 1.0)
         self.declare_parameter("fullres_frame_timeout_sec", 12.0)
         self.declare_parameter("fullres_allow_fallback", False)
@@ -156,9 +162,9 @@ class ClipObjectCaptureSession(Node):
             else None
         )
         self.jog_pub = self.create_publisher(TwistStamped, self.param_str("jog_twist_topic"), 10)
-        self.focus_param_client = AsyncParametersClient(self, self.param_str("focus_camera_node"))
+        self.focus_param_client = AsyncParameterClient(self, self.param_str("focus_camera_node"))
         self._focus_request_serial = 0
-        self.fullres_param_client = AsyncParametersClient(self, self.param_str("fullres_camera_node"))
+        self.fullres_param_client = AsyncParameterClient(self, self.param_str("fullres_camera_node"))
         self.fullres_capture_client = self.create_client(Trigger, self.param_str("fullres_capture_service"))
         self.oak_stop_client = self.create_client(Trigger, self.param_str("oak_stop_service"))
         self.oak_start_client = self.create_client(Trigger, self.param_str("oak_start_service"))
@@ -209,6 +215,12 @@ class ClipObjectCaptureSession(Node):
         self._reported_configured_tcp_camera = False
         self.clicked_pixel_uv: list[float] | None = None
         self.anchor: dict[str, Any] | None = None
+        self.roi_template: dict[str, list[float]] | None = None
+        self.roi_edit_active = False
+        self.roi_drag_start_uv: np.ndarray | None = None
+        self.roi_drag_current_uv: np.ndarray | None = None
+        self._display_anchor_pixel_uv: np.ndarray | None = None
+        self._display_image_size: tuple[int, int] | None = None
         self.gui_target: np.ndarray | None = None
         self.gui_target_anchor_base: np.ndarray | None = None
         self.gui_target_source = ""
@@ -232,7 +244,8 @@ class ClipObjectCaptureSession(Node):
         self.get_logger().info(f"Writing clip capture session to {self.output_dir}")
         self.get_logger().info(
             "GUI keys: click=set anchor, z=center, n=next target, g=go, "
-            "c=save, b=back, arrows/PgUp/PgDn=jog, m=toggle rotation jog, .=stop, q=quit"
+            "r=edit ROI, c=save, b=back, arrows/PgUp/PgDn=jog, "
+            "m=toggle rotation jog, .=stop, q=quit"
         )
 
     def param_str(self, name: str) -> str:
@@ -398,12 +411,33 @@ class ClipObjectCaptureSession(Node):
             self.draw_text_lines(view, [self.last_status])
             return view
 
+        image_size = (int(image.shape[1]), int(image.shape[0]))
+        self._display_image_size = image_size
+        anchor_pixel = self.current_anchor_pixel(image.shape[:2])
+        self._display_anchor_pixel_uv = anchor_pixel
         view, self.display_scale = self.resize_for_display(image)
         if self.anchor is not None:
-            pixel = self.anchor["pixel_uv"]
-            center = (int(round(pixel[0] * self.display_scale)), int(round(pixel[1] * self.display_scale)))
+            center = (
+                int(round(anchor_pixel[0] * self.display_scale)),
+                int(round(anchor_pixel[1] * self.display_scale)),
+            )
             cv2.drawMarker(view, center, (0, 255, 255), cv2.MARKER_CROSS, 42, 3, cv2.LINE_AA)
             cv2.circle(view, center, 20, (0, 180, 255), 2, cv2.LINE_AA)
+
+        roi = self.preview_roi_xywh(image.shape[:2], anchor_pixel)
+        if roi is not None:
+            x, y, width, height = roi
+            color = (0, 255, 0) if not self.roi_edit_active else (0, 210, 255)
+            p0 = (int(round(x * self.display_scale)), int(round(y * self.display_scale)))
+            p1 = (
+                int(round((x + width) * self.display_scale)),
+                int(round((y + height) * self.display_scale)),
+            )
+            cv2.rectangle(view, p0, p1, color, 2, cv2.LINE_AA)
+        if self.roi_edit_active and self.roi_drag_start_uv is not None and self.roi_drag_current_uv is not None:
+            p0 = tuple(int(round(value * self.display_scale)) for value in self.roi_drag_start_uv)
+            p1 = tuple(int(round(value * self.display_scale)) for value in self.roi_drag_current_uv)
+            cv2.rectangle(view, p0, p1, (255, 200, 0), 2, cv2.LINE_AA)
 
         status = self.status_lines(image.shape[:2])
         self.draw_text_lines(view, status)
@@ -438,6 +472,12 @@ class ClipObjectCaptureSession(Node):
         cloud_text = "cloud: no"
         if self.latest_cloud_msg is not None:
             cloud_text = f"cloud: {self.latest_cloud_msg.width}x{self.latest_cloud_msg.height}"
+        roi = self.preview_roi_xywh(image_shape, self._display_anchor_pixel_uv)
+        roi_text = "ROI: none"
+        if roi is not None:
+            roi_text = f"ROI: {roi[2]}x{roi[3]} at [{roi[0]}, {roi[1]}]"
+            if self.roi_edit_active:
+                roi_text += " - drag a new rectangle"
         if self.capture_active:
             target_text = str(self.active_capture_context.get("status", "capturing 48 MP photo..."))
         elif self.move_active:
@@ -448,6 +488,7 @@ class ClipObjectCaptureSession(Node):
             self.last_status,
             f"image: {image_shape[1]}x{image_shape[0]}  {cloud_text}",
             anchor_text,
+            roi_text,
             target_text,
             f"samples saved: {len(self.camera_pose_records)}  output: {self.output_dir}",
             (
@@ -456,16 +497,192 @@ class ClipObjectCaptureSession(Node):
                 f"mode={'rot' if self.rotation_jog_mode else 'xyz'}"
             ),
             f"last key: {self.last_key_text}  {self.last_jog_text}",
-            "click anchor | z prepare center | g go (needs move on) | n next | c save | . stop | q quit",
+            "click anchor | r draw ROI | z prepare center | g go | n next | c save | . stop | q quit",
         ]
 
     def on_mouse(self, event: int, x: int, y: int, _flags: int, _param: Any) -> None:
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
         if self.display_scale <= 0.0:
             return
-        pixel = (float(x) / self.display_scale, float(y) / self.display_scale)
-        self.set_anchor_from_click(pixel)
+        pixel = np.array([float(x) / self.display_scale, float(y) / self.display_scale])
+        if self._display_image_size is not None:
+            pixel[0] = np.clip(pixel[0], 0.0, self._display_image_size[0] - 1.0)
+            pixel[1] = np.clip(pixel[1], 0.0, self._display_image_size[1] - 1.0)
+
+        if self.roi_edit_active:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.roi_drag_start_uv = pixel
+                self.roi_drag_current_uv = pixel.copy()
+            elif event == cv2.EVENT_MOUSEMOVE and self.roi_drag_start_uv is not None:
+                self.roi_drag_current_uv = pixel
+            elif event == cv2.EVENT_LBUTTONUP and self.roi_drag_start_uv is not None:
+                self.roi_drag_current_uv = pixel
+                self.commit_roi_drag()
+            return
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.set_anchor_from_click((float(pixel[0]), float(pixel[1])))
+
+    def current_anchor_pixel(self, image_shape: tuple[int, int]) -> np.ndarray:
+        fallback = self.clicked_pixel_uv
+        if self.anchor is not None:
+            fallback = self.anchor.get("pixel_uv", fallback)
+        if fallback is None:
+            fallback = [0.5 * image_shape[1], 0.5 * image_shape[0]]
+        fallback_pixel = np.asarray(fallback, dtype=np.float64).reshape(2)
+        if self.anchor is None or self.latest_camera_info is None:
+            return fallback_pixel
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.param_str("robot_base_frame"),
+                self.param_str("robot_tcp_frame"),
+                Time(),
+            )
+            translation = transform.transform.translation
+            rotation = transform.transform.rotation
+            T_base_tcp = transform_from_translation_quaternion(
+                [translation.x, translation.y, translation.z],
+                [rotation.x, rotation.y, rotation.z, rotation.w],
+            )
+            T_tcp_camera = self.configured_tcp_camera_transform()
+            if T_tcp_camera is None:
+                camera_frame = self.param_str("camera_frame") or self.latest_camera_info.header.frame_id
+                camera_transform = self.tf_buffer.lookup_transform(
+                    self.param_str("robot_base_frame"), camera_frame, Time()
+                )
+                translation = camera_transform.transform.translation
+                rotation = camera_transform.transform.rotation
+                T_base_camera = transform_from_translation_quaternion(
+                    [translation.x, translation.y, translation.z],
+                    [rotation.x, rotation.y, rotation.z, rotation.w],
+                )
+            else:
+                T_base_camera = T_base_tcp @ T_tcp_camera
+            point_camera = transform_point(
+                invert_transform(T_base_camera),
+                np.asarray(self.anchor["p_base_anchor"], dtype=np.float64),
+            )
+            camera_pixel = project_camera_point_to_pixel(
+                point_camera, self.rectified_camera_matrix(self.latest_camera_info)
+            )
+            return map_pixel_center_crop(
+                camera_pixel,
+                (int(self.latest_camera_info.width), int(self.latest_camera_info.height)),
+                (int(image_shape[1]), int(image_shape[0])),
+            )
+        except (TransformException, ValueError):
+            return fallback_pixel
+
+    def anchor_pixel_for_observation(self, observation: Observation) -> np.ndarray:
+        point_camera = transform_point(
+            invert_transform(observation.T_base_camera),
+            np.asarray(self.anchor["p_base_anchor"], dtype=np.float64),
+        )
+        camera_pixel = project_camera_point_to_pixel(
+            point_camera, self.rectified_camera_matrix(observation.camera_info)
+        )
+        return map_pixel_center_crop(
+            camera_pixel,
+            (int(observation.camera_info.width), int(observation.camera_info.height)),
+            (int(observation.image.shape[1]), int(observation.image.shape[0])),
+        )
+
+    def preview_roi_xywh(
+        self,
+        image_shape: tuple[int, int],
+        anchor_pixel: np.ndarray | None = None,
+    ) -> tuple[int, int, int, int] | None:
+        if self.roi_template is None:
+            return None
+        image_height, image_width = (int(value) for value in image_shape)
+        if anchor_pixel is None:
+            anchor_pixel = self.current_anchor_pixel(image_shape)
+        offset = np.asarray(self.roi_template["center_offset_fraction_uv"], dtype=np.float64)
+        size = np.asarray(self.roi_template["size_fraction_wh"], dtype=np.float64)
+        roi_width = size[0] * image_width
+        roi_height = size[1] * image_height
+        center = np.asarray(anchor_pixel, dtype=np.float64) + offset * [image_width, image_height]
+        return clamp_roi_xywh(
+            (center[0] - 0.5 * roi_width, center[1] - 0.5 * roi_height, roi_width, roi_height),
+            (image_width, image_height),
+            int(self.get_parameter("roi_min_size_px").value),
+        )
+
+    def store_roi_template(
+        self,
+        roi_xywh: tuple[float, float, float, float],
+        anchor_pixel: np.ndarray,
+        image_shape: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        image_height, image_width = (int(value) for value in image_shape)
+        roi = clamp_roi_xywh(
+            roi_xywh,
+            (image_width, image_height),
+            int(self.get_parameter("roi_min_size_px").value),
+        )
+        x, y, width, height = roi
+        center = np.array([x + 0.5 * width, y + 0.5 * height], dtype=np.float64)
+        self.roi_template = {
+            "center_offset_fraction_uv": (
+                (center - np.asarray(anchor_pixel, dtype=np.float64)) / [image_width, image_height]
+            ).astype(float).tolist(),
+            "size_fraction_wh": [float(width) / image_width, float(height) / image_height],
+        }
+        return roi
+
+    def ensure_default_roi(self, anchor_pixel: np.ndarray, image_shape: tuple[int, int]) -> None:
+        if self.roi_template is not None:
+            return
+        fraction = float(np.clip(self.get_parameter("roi_default_size_fraction").value, 0.02, 1.0))
+        side = max(
+            int(self.get_parameter("roi_min_size_px").value),
+            int(round(fraction * min(image_shape))),
+        )
+        roi = self.store_roi_template(
+            (anchor_pixel[0] - 0.5 * side, anchor_pixel[1] - 0.5 * side, side, side),
+            anchor_pixel,
+            image_shape,
+        )
+        self.get_logger().info(f"Created default session ROI {roi}; press r to redraw it")
+
+    def toggle_roi_edit(self) -> None:
+        if self.anchor is None:
+            self.report_status("ROI edit blocked: click an anchor first", "warn")
+            return
+        self.roi_edit_active = not self.roi_edit_active
+        self.roi_drag_start_uv = None
+        self.roi_drag_current_uv = None
+        if self.roi_edit_active:
+            self.report_status("ROI edit active: drag a rectangle around the clip", "info")
+        else:
+            self.report_status("ROI edit canceled; keeping previous ROI", "info")
+
+    def commit_roi_drag(self) -> None:
+        if self.roi_drag_start_uv is None or self.roi_drag_current_uv is None:
+            return
+        if self._display_image_size is None or self._display_anchor_pixel_uv is None:
+            self.report_status("ROI edit failed: no current image geometry", "warn")
+            return
+        start = np.minimum(self.roi_drag_start_uv, self.roi_drag_current_uv)
+        end = np.maximum(self.roi_drag_start_uv, self.roi_drag_current_uv)
+        width, height = end - start
+        minimum = int(self.get_parameter("roi_min_size_px").value)
+        if width < minimum or height < minimum:
+            self.roi_drag_start_uv = None
+            self.roi_drag_current_uv = None
+            self.report_status(f"ROI too small; draw at least {minimum}x{minimum} px", "warn")
+            return
+        image_width, image_height = self._display_image_size
+        roi = self.store_roi_template(
+            (start[0], start[1], width, height),
+            self._display_anchor_pixel_uv,
+            (image_height, image_width),
+        )
+        self.roi_edit_active = False
+        self.roi_drag_start_uv = None
+        self.roi_drag_current_uv = None
+        self.write_metadata()
+        self.report_status(f"session ROI set to {roi}; it will follow the 3D anchor", "info")
 
     def set_anchor_from_click(self, pixel_uv: tuple[float, float]) -> None:
         if self.capture_active:
@@ -513,20 +730,45 @@ class ClipObjectCaptureSession(Node):
             )
             return
 
-        estimate = estimate_anchor_from_xyz_image(
+        initial_radius = int(self.get_parameter("click_window_radius").value)
+        estimate, used_radius = estimate_anchor_from_xyz_image_expanding(
             xyz,
             depth_pixel_uv,
-            window_radius=int(self.get_parameter("click_window_radius").value),
+            window_radius=initial_radius,
+            max_window_radius=int(self.get_parameter("click_hole_search_max_radius").value),
+            radius_step=int(self.get_parameter("click_hole_search_step").value),
             min_points=int(self.get_parameter("click_min_points").value),
             max_mad_m=float(self.get_parameter("click_max_mad_m").value),
         )
         if not estimate.valid or estimate.point_camera is None:
-            self.report_status(f"anchor rejected: {estimate.reason}; quality={estimate.as_dict()}", "warn")
+            rejected_quality = estimate.as_dict()
+            rejected_quality["requested_window_radius_px"] = initial_radius
+            rejected_quality["used_window_radius_px"] = used_radius
+            self.report_status(f"anchor rejected: {estimate.reason}; quality={rejected_quality}", "warn")
             return
         quality = estimate.as_dict()
+        quality["requested_window_radius_px"] = initial_radius
+        quality["used_window_radius_px"] = used_radius
+        quality["depth_hole_recovered"] = used_radius > initial_radius
         K = self.rectified_camera_matrix(observation.camera_info)
+        point_camera = estimate.point_camera
+        if used_radius > initial_radius:
+            try:
+                camera_pixel = self.image_pixel_to_camera_pixel(
+                    pixel_uv,
+                    (image_w, image_h),
+                    observation.camera_info,
+                )
+                neighborhood_point = point_camera.copy()
+                point_camera = camera_point_from_pixel(camera_pixel, K, float(point_camera[2]))
+                quality["neighborhood_point_camera"] = neighborhood_point.astype(float).tolist()
+                quality["point_camera"] = point_camera.astype(float).tolist()
+                quality["depth_source"] = "nearest_valid_neighborhood_on_clicked_ray"
+            except ValueError as exc:
+                self.report_status(f"anchor hole recovery rejected: {exc}; quality={quality}", "warn")
+                return
         try:
-            reprojected_pixel = project_camera_point_to_pixel(estimate.point_camera, K)
+            reprojected_pixel = project_camera_point_to_pixel(point_camera, K)
         except ValueError as exc:
             self.report_status(f"anchor rejected: {exc}; quality={quality}", "warn")
             return
@@ -550,19 +792,28 @@ class ClipObjectCaptureSession(Node):
                 "warn",
             )
             return
-        if estimate.reason != "ok":
+        if used_radius > initial_radius:
+            self.report_status(
+                f"anchor accepted by filling a depth hole from a {used_radius}px neighborhood",
+                "warn",
+            )
+        elif estimate.reason != "ok":
             self.report_status(f"anchor accepted with degraded depth quality: {quality}", "warn")
 
-        p_base_anchor = transform_point(observation.T_base_camera, estimate.point_camera)
+        p_base_anchor = transform_point(observation.T_base_camera, point_camera)
         self.anchor = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "pixel_uv": [float(pixel_uv[0]), float(pixel_uv[1])],
             "camera_frame": observation.camera_frame,
             "base_frame": self.param_str("robot_base_frame"),
-            "p_camera_anchor": estimate.point_camera.astype(float).tolist(),
+            "p_camera_anchor": point_camera.astype(float).tolist(),
             "p_base_anchor": p_base_anchor.astype(float).tolist(),
             "quality": quality,
-            "source": "manual_click_rgbd_pointcloud",
+            "source": (
+                "manual_click_rgbd_hole_recovery"
+                if used_radius > initial_radius
+                else "manual_click_rgbd_pointcloud"
+            ),
             "image_stamp": stamp_dict(observation.image_msg.header.stamp),
             "cloud_stamp": stamp_dict(observation.cloud_msg.header.stamp) if observation.cloud_msg is not None else None,
             "T_base_camera_at_click": matrix_to_list(observation.T_base_camera),
@@ -575,10 +826,12 @@ class ClipObjectCaptureSession(Node):
         self.report_status(
             "anchor set: "
             f"base=[{p_base_anchor[0]:.3f}, {p_base_anchor[1]:.3f}, {p_base_anchor[2]:.3f}], "
-            f"depth={estimate.point_camera[2]:.3f}m, reprojection={reprojection_error:.1f}px",
+            f"depth={point_camera[2]:.3f}m, reprojection={reprojection_error:.1f}px, "
+            f"depth radius={used_radius}px",
             "info",
         )
-        self.focus_for_depth(float(estimate.point_camera[2]))
+        self.ensure_default_roi(np.asarray(pixel_uv, dtype=np.float64), observation.image.shape[:2])
+        self.focus_for_depth(float(point_camera[2]))
         self.write_anchors()
         self.write_metadata()
         if self.param_bool("save_anchor_approx_tf"):
@@ -637,7 +890,7 @@ class ClipObjectCaptureSession(Node):
         if not self.param_bool("focus_on_click") or not np.isfinite(depth_m) or depth_m <= 0.0:
             return
         position = self.fullres_focus_position(depth_m)
-        if not self.focus_param_client.service_is_ready():
+        if not self.focus_param_client.services_are_ready():
             self.get_logger().warn(
                 f"Focus service {self.param_str('focus_camera_node')}/set_parameters is unavailable"
             )
@@ -761,6 +1014,7 @@ class ClipObjectCaptureSession(Node):
             f"depth={depth_m:.3f}m",
             "warn",
         )
+        self.ensure_default_roi(np.asarray(pixel_uv, dtype=np.float64), observation.image.shape[:2])
         self.focus_for_depth(depth_m)
         self.write_anchors()
         self.write_metadata()
@@ -920,6 +1174,12 @@ class ClipObjectCaptureSession(Node):
             return True
         if self.capture_active:
             self.report_status("command blocked during full-resolution capture", "warn")
+            return True
+        if char == "r":
+            self.toggle_roi_edit()
+            return True
+        if self.roi_edit_active:
+            self.report_status("finish the ROI drag or press r to cancel it", "warn")
             return True
         if char == "m":
             self.rotation_jog_mode = not self.rotation_jog_mode
@@ -1417,25 +1677,28 @@ class ClipObjectCaptureSession(Node):
             float(self.get_parameter("focus_macro_distance_m").value),
         )
 
-    def fullres_pixel_and_roi(self, observation: Observation) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    def fullres_pixel_and_roi(
+        self, observation: Observation
+    ) -> tuple[np.ndarray, tuple[int, int, int, int], tuple[int, int, int, int]]:
         full_width = int(self.get_parameter("fullres_width").value)
         full_height = int(self.get_parameter("fullres_height").value)
         image_height, image_width = observation.image.shape[:2]
-        pixel = np.asarray(self.anchor["pixel_uv"], dtype=np.float64)
+        pixel = self.anchor_pixel_for_observation(observation)
+        self.ensure_default_roi(pixel, observation.image.shape[:2])
+        preview_roi = self.preview_roi_xywh(observation.image.shape[:2], pixel)
+        if preview_roi is None:
+            raise RuntimeError("session ROI is unavailable")
         full_pixel = map_pixel_from_center_crop(
             pixel, (full_width, full_height), (image_width, image_height)
         )
         full_pixel[0] = np.clip(full_pixel[0], 0.0, full_width - 1.0)
         full_pixel[1] = np.clip(full_pixel[1], 0.0, full_height - 1.0)
-
-        roi_size = max(1, int(self.get_parameter("fullres_focus_roi_size_px").value))
-        roi_width = min(roi_size, full_width)
-        roi_height = min(roi_size, full_height)
-        roi_x = int(round(full_pixel[0] - 0.5 * roi_width))
-        roi_y = int(round(full_pixel[1] - 0.5 * roi_height))
-        roi_x = int(np.clip(roi_x, 0, full_width - roi_width))
-        roi_y = int(np.clip(roi_y, 0, full_height - roi_height))
-        return full_pixel, (roi_x, roi_y, roi_width, roi_height)
+        full_roi = map_roi_from_center_crop(
+            preview_roi,
+            (full_width, full_height),
+            (image_width, image_height),
+        )
+        return full_pixel, preview_roi, full_roi
 
     def start_fullres_capture(self, observation: Observation) -> None:
         if self.capture_active:
@@ -1454,7 +1717,7 @@ class ClipObjectCaptureSession(Node):
                 "error",
             )
             return
-        if not self.fullres_param_client.service_is_ready():
+        if not self.fullres_param_client.services_are_ready():
             self.report_status(
                 f"save blocked: parameter service for {self.param_str('fullres_camera_node')} is unavailable",
                 "error",
@@ -1470,7 +1733,7 @@ class ClipObjectCaptureSession(Node):
 
         requested_width = int(self.get_parameter("fullres_width").value)
         requested_height = int(self.get_parameter("fullres_height").value)
-        full_pixel, roi = self.fullres_pixel_and_roi(observation)
+        full_pixel, preview_roi, roi = self.fullres_pixel_and_roi(observation)
         depth_m = float(np.asarray(self.anchor["p_camera_anchor"], dtype=np.float64)[2])
         focus_position = self.fullres_focus_position(depth_m)
         image_rel = f"images/{self.sample_index:06d}.{image_format}"
@@ -1483,7 +1746,9 @@ class ClipObjectCaptureSession(Node):
             "image_path": image_path,
             "roi_path": roi_path,
             "sidecar_path": Path(str(image_path) + ".camera_info.yaml"),
+            "preview_pixel_uv": self.anchor_pixel_for_observation(observation).astype(float).tolist(),
             "fullres_pixel_uv": full_pixel.astype(float).tolist(),
+            "preview_roi_xywh": [int(value) for value in preview_roi],
             "focus_roi_xywh": [int(value) for value in roi],
             "focus_depth_m": depth_m,
             "focus_mode": self.param_str("fullres_focus_mode"),
@@ -1612,23 +1877,30 @@ class ClipObjectCaptureSession(Node):
 
         observation: Observation = context["observation"]
         image_height, image_width = observation.image.shape[:2]
-        preview_pixel = np.asarray(self.anchor["pixel_uv"], dtype=np.float64)
+        preview_pixel = self.anchor_pixel_for_observation(observation)
         capture_pixel = map_pixel_from_center_crop(
             preview_pixel, (width, height), (image_width, image_height)
         )
         capture_pixel[0] = np.clip(capture_pixel[0], 0.0, width - 1.0)
         capture_pixel[1] = np.clip(capture_pixel[1], 0.0, height - 1.0)
-        roi_size = min(max(1, int(self.get_parameter("fullres_focus_roi_size_px").value)), width, height)
-        roi_x = int(np.clip(round(capture_pixel[0] - 0.5 * roi_size), 0, width - roi_size))
-        roi_y = int(np.clip(round(capture_pixel[1] - 0.5 * roi_size), 0, height - roi_size))
+        preview_roi = self.preview_roi_xywh(observation.image.shape[:2], preview_pixel)
+        if preview_roi is None:
+            return False
+        capture_roi = map_roi_from_center_crop(
+            preview_roi,
+            (width, height),
+            (image_width, image_height),
+        )
 
         context["fallback_attempted"] = True
         context["primary_error"] = reason
         context["capture_width"] = width
         context["capture_height"] = height
         context["focus_mode"] = "manual"
+        context["preview_pixel_uv"] = preview_pixel.astype(float).tolist()
         context["fullres_pixel_uv"] = capture_pixel.astype(float).tolist()
-        context["focus_roi_xywh"] = [roi_x, roi_y, roi_size, roi_size]
+        context["preview_roi_xywh"] = [int(value) for value in preview_roi]
+        context["focus_roi_xywh"] = [int(value) for value in capture_roi]
         context["status"] = f"48 MP unavailable; retrying explicit fallback {width}x{height}..."
         self.report_status(context["status"], "warn")
         self.configure_fullres_capture()
@@ -1713,7 +1985,8 @@ class ClipObjectCaptureSession(Node):
             "requested_image_size": context["requested_size"],
             "image_size": [width, height],
             "preview_image_size": [int(observation.image.shape[1]), int(observation.image.shape[0])],
-            "preview_pixel_uv": [float(value) for value in self.anchor["pixel_uv"]],
+            "preview_pixel_uv": context["preview_pixel_uv"],
+            "preview_roi_xywh": context["preview_roi_xywh"],
             "fullres_pixel_uv": context["fullres_pixel_uv"],
             "focus_roi_xywh": context["focus_roi_xywh"],
             "focus_mode": context["focus_mode"],
@@ -1828,6 +2101,20 @@ class ClipObjectCaptureSession(Node):
         if not cv2.imwrite(str(image_path), observation.image):
             self.report_status(f"save failed: could not write {image_rel}", "warn")
             return
+        anchor_pixel = self.anchor_pixel_for_observation(observation)
+        self.ensure_default_roi(anchor_pixel, observation.image.shape[:2])
+        roi = self.preview_roi_xywh(observation.image.shape[:2], anchor_pixel)
+        if roi is None:
+            self.report_status("save failed: session ROI is unavailable", "warn")
+            return
+        roi_x, roi_y, roi_width, roi_height = roi
+        roi_rel = f"roi/{self.sample_index:06d}.png"
+        roi_path = self.output_dir / roi_rel
+        roi_path.parent.mkdir(parents=True, exist_ok=True)
+        roi_image = observation.image[roi_y : roi_y + roi_height, roi_x : roi_x + roi_width]
+        if not cv2.imwrite(str(roi_path), roi_image):
+            self.report_status(f"save failed: could not write {roi_rel}", "warn")
+            return
         self.write_intrinsics(observation.camera_info)
 
         record = {
@@ -1839,6 +2126,10 @@ class ClipObjectCaptureSession(Node):
             "T_base_tcp": matrix_to_list(observation.T_base_tcp),
             "capture_mode": "preview_explicit",
             "image_size": [int(observation.image.shape[1]), int(observation.image.shape[0])],
+            "preview_pixel_uv": anchor_pixel.astype(float).tolist(),
+            "preview_roi_xywh": [int(value) for value in roi],
+            "rgb_roi": roi_rel,
+            "roi_xywh_full": [int(value) for value in roi],
         }
         self.camera_pose_records.append(record)
 
@@ -1920,6 +2211,12 @@ class ClipObjectCaptureSession(Node):
             },
             "capture": {
                 "click_window_radius": int(self.get_parameter("click_window_radius").value),
+                "click_hole_search_max_radius": int(
+                    self.get_parameter("click_hole_search_max_radius").value
+                ),
+                "click_hole_search_step": int(
+                    self.get_parameter("click_hole_search_step").value
+                ),
                 "click_min_points": int(self.get_parameter("click_min_points").value),
                 "click_max_mad_m": float(self.get_parameter("click_max_mad_m").value),
                 "click_max_reprojection_error_px": float(
@@ -1937,6 +2234,11 @@ class ClipObjectCaptureSession(Node):
                 "fullres_focus_roi_size_px": int(
                     self.get_parameter("fullres_focus_roi_size_px").value
                 ),
+                "roi_default_size_fraction": float(
+                    self.get_parameter("roi_default_size_fraction").value
+                ),
+                "roi_min_size_px": int(self.get_parameter("roi_min_size_px").value),
+                "session_roi_template": self.roi_template,
                 "fullres_focus_settle_sec": float(
                     self.get_parameter("fullres_focus_settle_sec").value
                 ),
