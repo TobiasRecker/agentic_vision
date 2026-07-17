@@ -64,6 +64,24 @@ position continues to come from clicked-point depth. To explicitly return to pre
 set both `fullres_enabled: false` and `fullres_required: false`; resulting samples are marked
 `preview_explicit`.
 
+
+### Automatic capture sequence
+
+Set the desired pose count through `SAMPLES` (default 18), start with robot motion explicitly
+enabled, click the object anchor, and adjust the ROI if needed:
+
+```bash
+MOVE_ENABLED=true SAMPLES=18 \
+  ./src/agentic_vision/clip_pose_agent_starter/scripts/run_clip_capture.sh
+```
+
+Press `v` once to start. For every sample the GUI generates the next spiral pose, checks TCP and
+camera translation plus rotation against the configured safety limits, sends the robot goal,
+waits for standstill, captures the focused 8000x6000 image, restarts RGB-D, and waits for a fresh
+image, CameraInfo, and PointCloud before continuing. Any rejected pose, failed move, failed image,
+or RGB-D restart timeout stops the sequence. Press `v`, space, or `.` to stop it manually; an
+already running full-resolution exposure finishes safely, while an active robot goal is canceled.
+
 As a temporary 4K path, the capture node can save the running ROS RGB stream. First set the
 anchor while OAK is in `RGBD + PointCloud` mode. Then switch OAK Settings to `RGB`,
 `3840x2160 @ 5 Hz`, compressed, with a high transport quality and restart OAK. The capture node

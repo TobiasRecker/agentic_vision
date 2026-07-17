@@ -266,7 +266,7 @@ class ClipObjectCaptureSession(Node):
         self.write_metadata()
         self.get_logger().info(f"Writing clip capture session to {self.output_dir}")
         self.get_logger().info(
-            "GUI keys: click=set anchor, a=auto sequence, z=center, n=next target, g=go, "
+            "GUI keys: click=set anchor, v=auto sequence, z=center, n=next target, g=go, "
             "r=edit ROI, c=save, b=back, arrows/PgUp/PgDn=jog, "
             "m=toggle rotation jog, .=stop, q=quit"
         )
@@ -529,7 +529,7 @@ class ClipObjectCaptureSession(Node):
                 f"mode={'rot' if self.rotation_jog_mode else 'xyz'}"
             ),
             f"last key: {self.last_key_text}  {self.last_jog_text}",
-            "click anchor | r ROI | a auto | z center | g go | n next | c save | . stop | q quit",
+            "click anchor | r ROI | v auto | z center | g go | n next | c save | . stop | q quit",
         ]
 
     def on_mouse(self, event: int, x: int, y: int, _flags: int, _param: Any) -> None:
@@ -1208,7 +1208,7 @@ class ClipObjectCaptureSession(Node):
             self.gui_target_source = ""
             self.report_status("stop requested; target cleared", "info")
             return True
-        if char == "a":
+        if char == "v":
             if self.auto_sequence_active:
                 self.stop_auto_sequence("automatic capture stopped by user")
                 if self.move_active:
@@ -1475,6 +1475,9 @@ class ClipObjectCaptureSession(Node):
         if self.anchor is None:
             self.report_status("auto start blocked: click an anchor first", "warn")
             return False
+        if self.latest_cloud_msg is None:
+            self.report_status("auto start blocked: waiting for PointCloud2", "warn")
+            return False
         if not self.param_bool("move_enabled"):
             self.report_status("auto start blocked: move_enabled is false", "warn")
             return False
@@ -1604,11 +1607,23 @@ class ClipObjectCaptureSession(Node):
             if now > self.auto_stage_timeout_at:
                 self.stop_auto_sequence("timed out waiting for a fresh RGBD image", "error")
                 return
-            if now < self.auto_stage_ready_at or self.last_image_received_at <= self.auto_wait_image_after:
+            if now < self.auto_stage_ready_at:
+                return
+            if (
+                self.last_image_received_at <= self.auto_wait_image_after
+                or self.last_camera_info_received_at <= self.auto_wait_image_after
+                or self.last_cloud_received_at <= self.auto_wait_image_after
+            ):
                 return
             self.prepare_next_auto_target()
 
-    def on_auto_move_finished(self, context: dict[str, Any], success: bool, canceled: bool, message: str) -> None:
+    def on_auto_move_finished(
+        self,
+        context: dict[str, Any],
+        success: bool,
+        canceled: bool,
+        message: str,
+    ) -> None:
         if not context.get("auto_sequence") or not self.auto_sequence_active:
             return
         if canceled or not success:
@@ -1616,12 +1631,16 @@ class ClipObjectCaptureSession(Node):
             return
         now = time.monotonic()
         self.auto_sequence_stage = "settling after move"
-        self.auto_stage_ready_at = now + max(0.0, float(self.get_parameter("auto_move_settle_sec").value))
+        self.auto_stage_ready_at = now + max(
+            0.0,
+            float(self.get_parameter("auto_move_settle_sec").value),
+        )
         self.report_status(
             f"automatic pose {self.auto_sequence_completed + 1}/{self.auto_sequence_total}: "
             "move complete; waiting for standstill",
             "info",
         )
+        self.write_metadata()
 
     def on_auto_capture_finished(self, success: bool, message: str) -> None:
         if not self.auto_sequence_active:
@@ -1639,7 +1658,10 @@ class ClipObjectCaptureSession(Node):
         now = time.monotonic()
         self.auto_sequence_stage = "waiting for RGBD"
         self.auto_wait_image_after = now
-        self.auto_stage_ready_at = now + max(0.0, float(self.get_parameter("auto_rgbd_settle_sec").value))
+        self.auto_stage_ready_at = now + max(
+            0.0,
+            float(self.get_parameter("auto_rgbd_settle_sec").value),
+        )
         self.auto_stage_timeout_at = now + max(
             1.0,
             float(self.get_parameter("auto_stage_timeout_sec").value),
@@ -1649,6 +1671,7 @@ class ClipObjectCaptureSession(Node):
             "waiting for fresh RGBD",
             "info",
         )
+        self.write_metadata()
 
     def start_pose_goal(self, T_base_tcp: np.ndarray, context: dict[str, Any]) -> bool:
         if self.move_active:
@@ -1806,8 +1829,8 @@ class ClipObjectCaptureSession(Node):
             self.report_status(f"{label} done: {message}", "info")
         else:
             self.report_status(f"{label} failed: {message}", "warn")
-        self.write_metadata()
         self.on_auto_move_finished(context, bool(success), canceled, message)
+        self.write_metadata()
 
     def jog_command_from_key(self, key: int) -> tuple[np.ndarray | None, np.ndarray | None]:
         name = key_name(key)
@@ -1980,7 +2003,12 @@ class ClipObjectCaptureSession(Node):
         requested_width = int(self.get_parameter("fullres_width").value)
         requested_height = int(self.get_parameter("fullres_height").value)
         full_pixel, preview_roi, roi = self.fullres_pixel_and_roi(observation)
-        depth_m = float(np.asarray(self.anchor["p_camera_anchor"], dtype=np.float64)[2])
+        anchor_base = np.asarray(self.anchor["p_base_anchor"], dtype=np.float64)
+        anchor_camera = transform_point(invert_transform(observation.T_base_camera), anchor_base)
+        depth_m = float(anchor_camera[2])
+        if not np.isfinite(depth_m) or depth_m <= 0.0:
+            self.report_status("save blocked: anchor is behind the current camera pose", "error")
+            return
         focus_position = self.fullres_focus_position(depth_m)
         image_rel = f"images/{self.sample_index:06d}.{image_format}"
         image_path = self.output_dir / image_rel
