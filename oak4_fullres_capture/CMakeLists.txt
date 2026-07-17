@@ -3,7 +3,7 @@ project(oak4_fullres_capture)
 
 find_package(ament_cmake REQUIRED)
 find_package(depthai_v3 REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgcodecs)
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)

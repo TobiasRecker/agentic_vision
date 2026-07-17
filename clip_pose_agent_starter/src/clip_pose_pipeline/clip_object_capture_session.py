@@ -114,9 +114,10 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("focus_macro_distance_m", 0.08)
         self.declare_parameter("fullres_enabled", True)
         self.declare_parameter("fullres_required", True)
-        self.declare_parameter("fullres_hardware_enabled", False)
+        self.declare_parameter("fullres_hardware_enabled", True)
         self.declare_parameter("fullres_camera_node", "/oak_fullres_capture")
         self.declare_parameter("fullres_capture_service", "/oak_fullres_capture/capture")
+        self.declare_parameter("fullres_capture_backend", "raw10_host")
         self.declare_parameter("oak_stop_service", "/oak/stop_driver")
         self.declare_parameter("oak_start_service", "/oak/start_driver")
         self.declare_parameter("fullres_width", 8000)
@@ -124,7 +125,12 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("fullres_format", "jpg")
         self.declare_parameter("fullres_jpeg_quality", 97)
         self.declare_parameter("fullres_png_compression", 3)
-        self.declare_parameter("fullres_focus_mode", "auto_roi")
+        self.declare_parameter("fullres_raw_exposure_us", 30000)
+        self.declare_parameter("fullres_raw_iso", 800)
+        self.declare_parameter("fullres_raw_black_percentile", 0.5)
+        self.declare_parameter("fullres_raw_highlight_percentile", 99.7)
+        self.declare_parameter("fullres_raw_gamma", 2.2)
+        self.declare_parameter("fullres_focus_mode", "manual")
         self.declare_parameter("fullres_focus_roi_size_px", 800)
         self.declare_parameter("roi_default_size_fraction", 0.35)
         self.declare_parameter("roi_min_size_px", 24)
@@ -143,6 +149,9 @@ class ClipObjectCaptureSession(Node):
         self.declare_parameter("allow_2d_center_fallback", True)
         self.declare_parameter("fallback_center_depth_m", 0.45)
         self.declare_parameter("samples", 18)
+        self.declare_parameter("auto_move_settle_sec", 1.0)
+        self.declare_parameter("auto_rgbd_settle_sec", 1.0)
+        self.declare_parameter("auto_stage_timeout_sec", 20.0)
         self.declare_parameter("sphere_radius_m", 0.0)
         self.declare_parameter("sphere_polar_span_deg", 50.0)
         self.declare_parameter("sphere_spiral_turns", 1.25)
@@ -183,6 +192,7 @@ class ClipObjectCaptureSession(Node):
         self.image_compressed = self.param_bool("image_compressed") or self.param_str("image_topic").endswith(
             "/compressed"
         )
+        self.last_image_received_at = 0.0
         image_msg_type = CompressedImage if self.image_compressed else Image
         self.create_subscription(image_msg_type, self.param_str("image_topic"), self.on_image, qos)
         self.create_subscription(CameraInfo, self.param_str("camera_info_topic"), self.on_camera_info, qos)
@@ -244,11 +254,19 @@ class ClipObjectCaptureSession(Node):
         self.quit_after_move = False
         self.quit_after_capture = False
         self.active_capture_context: dict[str, Any] | None = None
+        self.auto_sequence_active = False
+        self.auto_sequence_stage = "idle"
+        self.auto_sequence_total = 0
+        self.auto_sequence_completed = 0
+        self.auto_stage_ready_at = 0.0
+        self.auto_stage_timeout_at = 0.0
+        self.auto_wait_image_after = 0.0
+        self.auto_capture_start_index = 0
 
         self.write_metadata()
         self.get_logger().info(f"Writing clip capture session to {self.output_dir}")
         self.get_logger().info(
-            "GUI keys: click=set anchor, z=center, n=next target, g=go, "
+            "GUI keys: click=set anchor, a=auto sequence, z=center, n=next target, g=go, "
             "r=edit ROI, c=save, b=back, arrows/PgUp/PgDn=jog, "
             "m=toggle rotation jog, .=stop, q=quit"
         )
@@ -359,6 +377,7 @@ class ClipObjectCaptureSession(Node):
         try:
             while rclpy.ok():
                 rclpy.spin_once(self, timeout_sec=0.0)
+                self.update_auto_sequence()
                 if self.quit_after_move and not self.move_active:
                     break
                 if self.quit_after_capture and not self.capture_active:
@@ -376,6 +395,7 @@ class ClipObjectCaptureSession(Node):
 
     def on_image(self, msg: Image | CompressedImage) -> None:
         self.latest_image_msg = msg
+        self.last_image_received_at = time.monotonic()
         if not self._reported_first_image:
             self._reported_first_image = True
             self.get_logger().info(
@@ -489,12 +509,19 @@ class ClipObjectCaptureSession(Node):
             target_text = self.move_feedback_text or "robot moving; press . to stop"
         else:
             target_text = "target: none" if self.gui_target is None else f"target: {self.gui_target_source}, press g"
+        auto_text = "auto: off"
+        if self.auto_sequence_active:
+            auto_text = (
+                f"auto: {self.auto_sequence_completed}/{self.auto_sequence_total} "
+                f"{self.auto_sequence_stage}"
+            )
         return [
             self.last_status,
             f"image: {image_shape[1]}x{image_shape[0]}  {cloud_text}",
             anchor_text,
             roi_text,
             target_text,
+            auto_text,
             f"samples saved: {len(self.camera_pose_records)}  output: {self.output_dir}",
             (
                 f"move={'on' if self.param_bool('move_enabled') else 'off'} "
@@ -502,7 +529,7 @@ class ClipObjectCaptureSession(Node):
                 f"mode={'rot' if self.rotation_jog_mode else 'xyz'}"
             ),
             f"last key: {self.last_key_text}  {self.last_jog_text}",
-            "click anchor | r draw ROI | z prepare center | g go | n next | c save | . stop | q quit",
+            "click anchor | r ROI | a auto | z center | g go | n next | c save | . stop | q quit",
         ]
 
     def on_mouse(self, event: int, x: int, y: int, _flags: int, _param: Any) -> None:
@@ -689,6 +716,9 @@ class ClipObjectCaptureSession(Node):
         self.write_metadata()
         self.report_status(f"session ROI set to {roi}; it will follow the 3D anchor", "info")
 
+        if self.auto_sequence_active:
+            self.report_status("click blocked during automatic capture; press . to stop", "warn")
+            return
     def set_anchor_from_click(self, pixel_uv: tuple[float, float]) -> None:
         if self.capture_active:
             self.report_status("click blocked during full-resolution capture", "warn")
@@ -1152,6 +1182,8 @@ class ClipObjectCaptureSession(Node):
             self.get_logger().info(f"Capture GUI key: {self.last_key_text}")
 
         if char == "q" or key == 27:
+            if self.auto_sequence_active:
+                self.stop_auto_sequence("quit requested")
             if self.capture_active:
                 self.quit_after_capture = True
                 self.report_status("quit requested; waiting for full-resolution capture to finish", "warn")
@@ -1162,9 +1194,11 @@ class ClipObjectCaptureSession(Node):
                 return True
             return False
         if char == "." or char == " ":
+            if self.auto_sequence_active:
+                self.stop_auto_sequence("stop requested")
             self.stop_jog(force=True)
             if self.capture_active:
-                self.report_status("full-resolution capture cannot be canceled safely", "warn")
+                self.report_status("automatic sequence stopped; current capture will finish", "warn")
                 return True
             if self.move_active:
                 self.cancel_active_move("stop requested")
@@ -1174,11 +1208,27 @@ class ClipObjectCaptureSession(Node):
             self.gui_target_source = ""
             self.report_status("stop requested; target cleared", "info")
             return True
+        if char == "a":
+            if self.auto_sequence_active:
+                self.stop_auto_sequence("automatic capture stopped by user")
+                if self.move_active:
+                    self.cancel_active_move("automatic capture stopped by user")
+                elif self.capture_active:
+                    self.report_status(
+                        "automatic sequence stopped; current full-resolution capture will finish",
+                        "warn",
+                    )
+                return True
+            self.start_auto_sequence()
+            return True
         if self.move_active:
             self.report_status("command blocked while robot is moving; press . to stop", "warn")
             return True
         if self.capture_active:
             self.report_status("command blocked during full-resolution capture", "warn")
+            return True
+        if self.auto_sequence_active:
+            self.report_status("command blocked during automatic capture; press . to stop", "warn")
             return True
         if char == "r":
             self.toggle_roi_edit()
@@ -1247,13 +1297,13 @@ class ClipObjectCaptureSession(Node):
         T_base_tcp_target = T_base_camera_target @ invert_transform(observation.T_tcp_camera)
         self.set_gui_target(source, T_base_tcp_target, observation, anchor_base_override=anchor_base)
 
-    def propose_next_target(self) -> None:
+    def propose_next_target(self) -> bool:
         if self.anchor is None:
             self.report_status("target blocked: click an anchor first", "warn")
-            return
+            return False
         observation = self.current_observation(require_cloud=False)
         if observation is None:
-            return
+            return False
         anchor_base = np.asarray(self.anchor["p_base_anchor"], dtype=np.float64)
         if not self.target_cache or self.target_cursor >= len(self.target_cache):
             radius = float(self.get_parameter("sphere_radius_m").value)
@@ -1283,12 +1333,13 @@ class ClipObjectCaptureSession(Node):
                 continue
             if not self.target_is_safe(metrics):
                 continue
-            self.set_gui_target(f"sphere {self.target_cursor}/{len(self.target_cache)}", T_base_tcp_target, observation)
-            return
+            if self.set_gui_target(f"sphere {self.target_cursor}/{len(self.target_cache)}", T_base_tcp_target, observation):
+                return True
 
         self.report_status("no safe target left; press n again to regenerate from current pose", "warn")
         self.target_cache = []
         self.target_cursor = 0
+        return False
 
     def set_gui_target(
         self,
@@ -1296,9 +1347,9 @@ class ClipObjectCaptureSession(Node):
         T_base_tcp_target: np.ndarray,
         observation: Observation,
         anchor_base_override: np.ndarray | None = None,
-    ) -> None:
+    ) -> bool:
         if self.anchor is None and anchor_base_override is None:
-            return
+            return False
         anchor_base = (
             np.asarray(anchor_base_override, dtype=np.float64)
             if anchor_base_override is not None
@@ -1312,7 +1363,7 @@ class ClipObjectCaptureSession(Node):
             look_axis=self.param_str("camera_look_axis"),
         )
         if not self.target_is_safe(metrics):
-            return
+            return False
         self.gui_target = T_base_tcp_target.copy()
         self.gui_target_anchor_base = anchor_base.copy()
         self.gui_target_source = source
@@ -1335,6 +1386,7 @@ class ClipObjectCaptureSession(Node):
         )
         self.write_metadata()
 
+        return True
     def target_is_safe(self, metrics: dict[str, Any]) -> bool:
         max_tcp = float(self.get_parameter("target_max_tcp_delta_m").value)
         max_camera = float(self.get_parameter("target_max_camera_delta_m").value)
@@ -1353,16 +1405,16 @@ class ClipObjectCaptureSession(Node):
             return False
         return True
 
-    def go_to_gui_target(self) -> None:
+    def go_to_gui_target(self, auto_sequence: bool = False) -> bool:
         if self.gui_target is None:
             self.report_status("go blocked: no target prepared", "warn")
-            return
+            return False
         if not self.param_bool("move_enabled"):
             self.report_status("go blocked: move_enabled is false", "warn")
-            return
+            return False
         observation = self.current_observation(require_cloud=False)
         if observation is None:
-            return
+            return False
         if self.gui_target_anchor_base is not None:
             metrics = target_motion_metrics(
                 observation.T_base_tcp,
@@ -1372,15 +1424,16 @@ class ClipObjectCaptureSession(Node):
                 look_axis=self.param_str("camera_look_axis"),
             )
             if not self.target_is_safe(metrics):
-                return
+                return False
         self.stop_jog(force=True)
-        self.start_pose_goal(
+        return self.start_pose_goal(
             self.gui_target,
             {
                 "kind": "target",
                 "label": f"target {self.gui_target_source}",
                 "source": self.gui_target_source,
                 "clear_target_on_success": True,
+                "auto_sequence": bool(auto_sequence),
             },
         )
 
@@ -1409,6 +1462,193 @@ class ClipObjectCaptureSession(Node):
     @property
     def capture_active(self) -> bool:
         return self.active_capture_context is not None
+
+    def start_auto_sequence(self) -> bool:
+        if self.auto_sequence_active:
+            return False
+        if self.move_active or self.capture_active:
+            self.report_status("auto start blocked while move or capture is active", "warn")
+            return False
+        if self.roi_edit_active:
+            self.report_status("auto start blocked: finish the ROI edit first", "warn")
+            return False
+        if self.anchor is None:
+            self.report_status("auto start blocked: click an anchor first", "warn")
+            return False
+        if not self.param_bool("move_enabled"):
+            self.report_status("auto start blocked: move_enabled is false", "warn")
+            return False
+        if not self.param_bool("fullres_enabled") or not self.param_bool("fullres_hardware_enabled"):
+            self.report_status("auto start blocked: validated full-resolution capture is disabled", "warn")
+            return False
+        if self.action_client is None or not self.action_client.server_is_ready():
+            self.report_status("auto start blocked: robot action server is unavailable", "warn")
+            return False
+        if not self.fullres_capture_client.service_is_ready():
+            self.report_status("auto start blocked: full-resolution capture service is unavailable", "warn")
+            return False
+        if not self.fullres_param_client.services_are_ready():
+            self.report_status("auto start blocked: full-resolution parameter service is unavailable", "warn")
+            return False
+
+        total = max(1, int(self.get_parameter("samples").value))
+        self.target_cache = []
+        self.target_cursor = 0
+        self.gui_target = None
+        self.gui_target_anchor_base = None
+        self.gui_target_source = ""
+        self.auto_sequence_active = True
+        self.auto_sequence_stage = "preparing"
+        self.auto_sequence_total = total
+        self.auto_sequence_completed = 0
+        self.auto_stage_ready_at = 0.0
+        self.auto_stage_timeout_at = 0.0
+        self.auto_wait_image_after = 0.0
+        self.target_history.append(
+            {
+                "event": "auto_sequence_started",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "samples_requested": total,
+            }
+        )
+        self.report_status(f"automatic capture started for {total} poses", "info")
+        self.write_metadata()
+        self.prepare_next_auto_target()
+        return self.auto_sequence_active
+
+    def stop_auto_sequence(self, reason: str, level: str = "warn") -> None:
+        if not self.auto_sequence_active:
+            return
+        completed = self.auto_sequence_completed
+        total = self.auto_sequence_total
+        self.auto_sequence_active = False
+        self.auto_sequence_stage = "stopped"
+        self.auto_stage_ready_at = 0.0
+        self.auto_stage_timeout_at = 0.0
+        self.target_history.append(
+            {
+                "event": "auto_sequence_stopped",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "samples_completed": completed,
+                "samples_requested": total,
+                "reason": reason,
+            }
+        )
+        self.report_status(f"automatic capture stopped at {completed}/{total}: {reason}", level)
+        self.write_metadata()
+
+    def finish_auto_sequence(self) -> None:
+        if not self.auto_sequence_active:
+            return
+        completed = self.auto_sequence_completed
+        total = self.auto_sequence_total
+        self.auto_sequence_active = False
+        self.auto_sequence_stage = "completed"
+        self.target_history.append(
+            {
+                "event": "auto_sequence_completed",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "samples_completed": completed,
+                "samples_requested": total,
+            }
+        )
+        self.report_status(f"automatic capture completed: {completed}/{total} poses saved", "info")
+        self.write_metadata()
+
+    def prepare_next_auto_target(self) -> None:
+        if not self.auto_sequence_active:
+            return
+        if self.auto_sequence_completed >= self.auto_sequence_total:
+            self.finish_auto_sequence()
+            return
+        self.auto_sequence_stage = "preparing target"
+        try:
+            proposed = self.propose_next_target()
+        except Exception as exc:  # noqa: BLE001
+            self.stop_auto_sequence(f"target generation failed: {exc}", "error")
+            return
+        if not proposed:
+            self.stop_auto_sequence("no further plausible target pose is available", "error")
+            return
+        if not self.go_to_gui_target(auto_sequence=True):
+            self.stop_auto_sequence("plausible target could not be sent to the robot", "error")
+            return
+        self.auto_sequence_stage = "moving"
+        self.report_status(
+            f"automatic pose {self.auto_sequence_completed + 1}/{self.auto_sequence_total}: robot moving",
+            "info",
+        )
+
+    def update_auto_sequence(self) -> None:
+        if not self.auto_sequence_active:
+            return
+        now = time.monotonic()
+        if self.auto_sequence_stage == "settling after move":
+            if now < self.auto_stage_ready_at:
+                return
+            self.auto_sequence_stage = "capturing"
+            self.auto_capture_start_index = self.sample_index
+            try:
+                self.save_sample()
+            except Exception as exc:  # noqa: BLE001
+                self.stop_auto_sequence(f"capture start failed: {exc}", "error")
+                return
+            if self.capture_active:
+                return
+            if self.sample_index > self.auto_capture_start_index:
+                self.on_auto_capture_finished(True, "sample saved synchronously")
+            else:
+                self.stop_auto_sequence("capture did not start", "error")
+            return
+        if self.auto_sequence_stage == "waiting for RGBD":
+            if now > self.auto_stage_timeout_at:
+                self.stop_auto_sequence("timed out waiting for a fresh RGBD image", "error")
+                return
+            if now < self.auto_stage_ready_at or self.last_image_received_at <= self.auto_wait_image_after:
+                return
+            self.prepare_next_auto_target()
+
+    def on_auto_move_finished(self, context: dict[str, Any], success: bool, canceled: bool, message: str) -> None:
+        if not context.get("auto_sequence") or not self.auto_sequence_active:
+            return
+        if canceled or not success:
+            self.stop_auto_sequence(f"robot move failed: {message}", "error")
+            return
+        now = time.monotonic()
+        self.auto_sequence_stage = "settling after move"
+        self.auto_stage_ready_at = now + max(0.0, float(self.get_parameter("auto_move_settle_sec").value))
+        self.report_status(
+            f"automatic pose {self.auto_sequence_completed + 1}/{self.auto_sequence_total}: "
+            "move complete; waiting for standstill",
+            "info",
+        )
+
+    def on_auto_capture_finished(self, success: bool, message: str) -> None:
+        if not self.auto_sequence_active:
+            return
+        if not success:
+            self.stop_auto_sequence(message, "error")
+            return
+        if self.sample_index <= self.auto_capture_start_index:
+            self.stop_auto_sequence("capture finished without committing a sample", "error")
+            return
+        self.auto_sequence_completed += 1
+        if self.auto_sequence_completed >= self.auto_sequence_total:
+            self.finish_auto_sequence()
+            return
+        now = time.monotonic()
+        self.auto_sequence_stage = "waiting for RGBD"
+        self.auto_wait_image_after = now
+        self.auto_stage_ready_at = now + max(0.0, float(self.get_parameter("auto_rgbd_settle_sec").value))
+        self.auto_stage_timeout_at = now + max(
+            1.0,
+            float(self.get_parameter("auto_stage_timeout_sec").value),
+        )
+        self.report_status(
+            f"automatic capture {self.auto_sequence_completed}/{self.auto_sequence_total} saved; "
+            "waiting for fresh RGBD",
+            "info",
+        )
 
     def start_pose_goal(self, T_base_tcp: np.ndarray, context: dict[str, Any]) -> bool:
         if self.move_active:
@@ -1567,6 +1807,7 @@ class ClipObjectCaptureSession(Node):
         else:
             self.report_status(f"{label} failed: {message}", "warn")
         self.write_metadata()
+        self.on_auto_move_finished(context, bool(success), canceled, message)
 
     def jog_command_from_key(self, key: int) -> tuple[np.ndarray | None, np.ndarray | None]:
         name = key_name(key)
@@ -1711,8 +1952,8 @@ class ClipObjectCaptureSession(Node):
             return
         if not self.param_bool("fullres_hardware_enabled"):
             self.report_status(
-                "save blocked: direct OAK full-resolution pipeline is disabled after reproducible firmware crashes; "
-                "keep false until the Luxonis Camera pipeline is validated",
+                "save blocked: full-resolution hardware capture is disabled; "
+                "enable fullres_hardware_enabled to use the validated raw10_host path",
                 "error",
             )
             return
@@ -1756,6 +1997,7 @@ class ClipObjectCaptureSession(Node):
             "preview_roi_xywh": [int(value) for value in preview_roi],
             "focus_roi_xywh": [int(value) for value in roi],
             "focus_depth_m": depth_m,
+            "capture_backend": self.param_str("fullres_capture_backend"),
             "focus_mode": self.param_str("fullres_focus_mode"),
             "focus_position_requested": focus_position,
             "requested_size": [requested_width, requested_height],
@@ -1800,11 +2042,12 @@ class ClipObjectCaptureSession(Node):
             return
         context = self.active_capture_context
         roi_x, roi_y, roi_width, roi_height = context["focus_roi_xywh"]
-        context["status"] = "configuring autofocus ROI..."
+        context["status"] = "configuring full-resolution capture..."
         parameters = [
             Parameter("enable_device_capture", value=self.param_bool("fullres_hardware_enabled")),
             Parameter("output_path", value=str(context["image_path"])),
             Parameter("roi_output_path", value=str(context["roi_path"])),
+            Parameter("capture_backend", value=str(context["capture_backend"])),
             Parameter("capture_width", value=int(context["capture_width"])),
             Parameter("capture_height", value=int(context["capture_height"])),
             Parameter("focus_mode", value=str(context["focus_mode"])),
@@ -1821,6 +2064,20 @@ class ClipObjectCaptureSession(Node):
                 "frame_timeout_sec",
                 value=float(self.get_parameter("fullres_frame_timeout_sec").value),
             ),
+            Parameter(
+                "raw_exposure_us",
+                value=int(self.get_parameter("fullres_raw_exposure_us").value),
+            ),
+            Parameter("raw_iso", value=int(self.get_parameter("fullres_raw_iso").value)),
+            Parameter(
+                "raw_black_percentile",
+                value=float(self.get_parameter("fullres_raw_black_percentile").value),
+            ),
+            Parameter(
+                "raw_highlight_percentile",
+                value=float(self.get_parameter("fullres_raw_highlight_percentile").value),
+            ),
+            Parameter("raw_gamma", value=float(self.get_parameter("fullres_raw_gamma").value)),
             Parameter(
                 "png_compression",
                 value=int(self.get_parameter("fullres_png_compression").value),
@@ -2060,10 +2317,12 @@ class ClipObjectCaptureSession(Node):
         if context.get("driver_stopped"):
             if not self.oak_start_client.service_is_ready():
                 self.active_capture_context = None
-                self.report_status(
-                    f"{message}; WARNING: RGBD restart service {self.param_str('oak_start_service')} unavailable",
-                    "error",
+                final_message = (
+                    f"{message}; RGBD restart service "
+                    f"{self.param_str('oak_start_service')} unavailable"
                 )
+                self.report_status(final_message, "error")
+                self.on_auto_capture_finished(False, final_message)
                 return
             context["status"] = f"{message}; restarting RGBD..."
             future = self.oak_start_client.call_async(Trigger.Request())
@@ -2071,6 +2330,7 @@ class ClipObjectCaptureSession(Node):
             return
         self.active_capture_context = None
         self.report_status(message, "info" if success else "error")
+        self.on_auto_capture_finished(bool(success), message)
 
     def on_oak_restarted_after_fullres(self, future: Any) -> None:
         if not self.capture_active:
@@ -2087,9 +2347,13 @@ class ClipObjectCaptureSession(Node):
         message = str(context.get("message", "full-resolution capture finished"))
         self.active_capture_context = None
         if restarted:
-            self.report_status(f"{message}; RGBD restarted", "info" if success else "error")
+            final_message = f"{message}; RGBD restarted"
+            final_success = success
         else:
-            self.report_status(f"{message}; RGBD restart failed: {restart_message}", "error")
+            final_message = f"{message}; RGBD restart failed: {restart_message}"
+            final_success = False
+        self.report_status(final_message, "info" if final_success else "error")
+        self.on_auto_capture_finished(final_success, final_message)
 
     def save_sample(self) -> None:
         if self.capture_active:
@@ -2355,6 +2619,18 @@ class ClipObjectCaptureSession(Node):
                     int(self.get_parameter("fullres_height").value),
                 ],
                 "fullres_format": self.param_str("fullres_format"),
+                "fullres_capture_backend": self.param_str("fullres_capture_backend"),
+                "fullres_raw_development": {
+                    "exposure_us": int(self.get_parameter("fullres_raw_exposure_us").value),
+                    "iso": int(self.get_parameter("fullres_raw_iso").value),
+                    "black_percentile": float(
+                        self.get_parameter("fullres_raw_black_percentile").value
+                    ),
+                    "highlight_percentile": float(
+                        self.get_parameter("fullres_raw_highlight_percentile").value
+                    ),
+                    "gamma": float(self.get_parameter("fullres_raw_gamma").value),
+                },
                 "fullres_focus_mode": self.param_str("fullres_focus_mode"),
                 "fullres_focus_roi_size_px": int(
                     self.get_parameter("fullres_focus_roi_size_px").value
@@ -2390,11 +2666,20 @@ class ClipObjectCaptureSession(Node):
                     self.get_parameter("capture_pose_max_rotation_deg").value
                 ),
                 "samples": int(self.get_parameter("samples").value),
+                "auto_move_settle_sec": float(self.get_parameter("auto_move_settle_sec").value),
+                "auto_rgbd_settle_sec": float(self.get_parameter("auto_rgbd_settle_sec").value),
+                "auto_stage_timeout_sec": float(self.get_parameter("auto_stage_timeout_sec").value),
                 "sphere_polar_span_deg": float(self.get_parameter("sphere_polar_span_deg").value),
                 "sphere_spiral_turns": float(self.get_parameter("sphere_spiral_turns").value),
                 "camera_look_axis": self.param_str("camera_look_axis"),
             },
             "target_history": self.target_history,
+            "auto_sequence": {
+                "active": self.auto_sequence_active,
+                "stage": self.auto_sequence_stage,
+                "completed": self.auto_sequence_completed,
+                "requested": self.auto_sequence_total,
+            },
         }
         write_yaml(self.output_dir / "capture_metadata.yaml", data)
 

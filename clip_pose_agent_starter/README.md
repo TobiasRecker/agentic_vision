@@ -43,22 +43,25 @@ IMAGE_TOPIC=/oak/rgb/image_raw IMAGE_COMPRESSED=false MOVE_ENABLED=true \
 
 The launch file also starts the idle `oak4_fullres_capture` helper. Pressing `c` freezes the
 current RGB-D observation and robot pose, maps the tracked preview ROI into the full sensor
-image, and uses it as the autofocus ROI. The requested photo, its full-resolution
-intrinsics, the RGB ROI, and the synchronized depth artifact are committed only when every
-required file has been validated. Manual focus is available through `fullres_focus_mode: manual`;
-the requested lens position is estimated from the clicked point's camera-frame depth.
+image. The requested photo, its full-resolution intrinsics, the RGB ROI, and the synchronized
+depth artifact are committed only when every required file has been validated. The manual lens
+position is estimated from the clicked point's camera-frame depth.
 The running `/oak` driver currently exposes the manual-focus enable flag but not the required
 integer `rgb.r_focus` position. Click focus therefore performs a capability check and leaves the
 live preview focus unchanged on this driver instead of partially applying an invalid request.
 
+At 8000x6000, the on-device ISP pipeline still crashes this OAK 4 D R9 reproducibly with
+Luxonis OS RVC4 1.35.0 / Agent 0.23.0 and both DepthAI 3.6.1 and 3.7.1. The crash dump shows
+failed GBM/DMA-BUF imports followed by an unsignalled camera fence and a firmware null-pointer
+abort. The sensor's packed 10-bit Bayer output is stable, so `raw10_host` bypasses the failing
+ISP, unpacks RAW10, demosaics RGGB, estimates black level and white balance, and tone-maps on the
+host. A ROS service test produced a validated 8000x6000 JPEG and 800x800 ROI.
 
-Direct `Camera` pipelines currently crash this OAK 4 D R9 reproducibly in device firmware with
-Luxonis OS RVC4 1.32.1 / Agent 0.20.0, including tests at 8000x6000, 4000x3000, and 1920x1080.
-Therefore `fullres_hardware_enabled` and `fullres_allow_fallback` default to `false`. With
-`fullres_required: true`, `c` reports a clear error and does not silently save the 1280x720
-preview. Enable `fullres_hardware_enabled` only after the direct pipeline has been validated with
-an updated Luxonis stack. To explicitly return to preview-only capture, set both
-`fullres_enabled: false` and `fullres_required: false`; resulting samples are marked
+The tested defaults enable `fullres_hardware_enabled`, select `raw10_host`, and use manual focus,
+30 ms exposure, and ISO 800. Tune `fullres_raw_exposure_us` and `fullres_raw_iso` for substantially
+different lighting. On-device autofocus is not available in the RAW-only pipeline; the lens
+position continues to come from clicked-point depth. To explicitly return to preview-only capture,
+set both `fullres_enabled: false` and `fullres_required: false`; resulting samples are marked
 `preview_explicit`.
 
 As a temporary 4K path, the capture node can save the running ROS RGB stream. First set the

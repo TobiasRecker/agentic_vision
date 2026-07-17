@@ -1,11 +1,14 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -14,6 +17,7 @@
 
 #include <depthai/depthai.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -31,7 +35,8 @@ class Oak4FullresCapture : public rclcpp::Node {
     declare_parameter<bool>("enable_device_capture", false);
     declare_parameter<int>("capture_width", 8000);
     declare_parameter<int>("capture_height", 6000);
-    declare_parameter<std::string>("focus_mode", "auto_roi");
+    declare_parameter<std::string>("capture_backend", "raw10_host");
+    declare_parameter<std::string>("focus_mode", "manual");
     declare_parameter<int>("focus_position", 150);
     declare_parameter<int>("focus_roi_x", 3600);
     declare_parameter<int>("focus_roi_y", 2600);
@@ -39,6 +44,11 @@ class Oak4FullresCapture : public rclcpp::Node {
     declare_parameter<int>("focus_roi_height", 800);
     declare_parameter<double>("focus_settle_sec", 1.0);
     declare_parameter<double>("frame_timeout_sec", 12.0);
+    declare_parameter<int>("raw_exposure_us", 30000);
+    declare_parameter<int>("raw_iso", 800);
+    declare_parameter<double>("raw_black_percentile", 0.5);
+    declare_parameter<double>("raw_highlight_percentile", 99.7);
+    declare_parameter<double>("raw_gamma", 2.2);
     declare_parameter<int>("png_compression", 3);
     declare_parameter<int>("jpeg_quality", 98);
     declare_parameter<bool>("publish_image", false);
@@ -56,6 +66,12 @@ class Oak4FullresCapture : public rclcpp::Node {
     cv::Mat image;
     sensor_msgs::msg::CameraInfo camera_info;
     int lens_position = 0;
+    std::string backend = "isp";
+    int exposure_us = 0;
+    int iso = 0;
+    int black_level = 0;
+    double red_gain = 1.0;
+    double blue_gain = 1.0;
   };
 
   void capture(const std_srvs::srv::Trigger::Request::SharedPtr,
@@ -101,7 +117,7 @@ class Oak4FullresCapture : public rclcpp::Node {
         }
         write_image(roi_path, result.image(cv::Rect(x, y, width, height)));
       }
-      write_camera_info(path.string() + ".camera_info.yaml", result.camera_info, result.lens_position);
+      write_camera_info(path.string() + ".camera_info.yaml", result);
 
       const auto stamp = now();
       result.camera_info.header.stamp = stamp;
@@ -112,7 +128,7 @@ class Oak4FullresCapture : public rclcpp::Node {
 
       std::ostringstream message;
       message << "saved " << path << " " << result.image.cols << "x" << result.image.rows
-              << " focus=" << result.lens_position;
+              << " backend=" << result.backend << " focus=" << result.lens_position;
       response->success = true;
       response->message = message.str();
       RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
@@ -128,7 +144,24 @@ class Oak4FullresCapture : public rclcpp::Node {
     const int requested_focus = std::clamp(static_cast<int>(get_parameter("focus_position").as_int()), 0, 255);
     const double settle_sec = std::max(0.0, get_parameter("focus_settle_sec").as_double());
     const double timeout_sec = std::max(0.1, get_parameter("frame_timeout_sec").as_double());
+    const int capture_width = static_cast<int>(get_parameter("capture_width").as_int());
+    const int capture_height = static_cast<int>(get_parameter("capture_height").as_int());
+    if (capture_width <= 0 || capture_height <= 0) {
+      throw std::runtime_error("capture_width and capture_height must be positive");
+    }
 
+    const auto backend = get_parameter("capture_backend").as_string();
+    if (backend == "raw10_host" && capture_width == 8000 && capture_height == 6000) {
+      return capture_raw10(capture_width, capture_height, requested_focus, focus_mode, settle_sec, timeout_sec);
+    }
+    if (backend != "isp" && backend != "raw10_host") {
+      throw std::runtime_error("capture_backend must be 'raw10_host' or 'isp'");
+    }
+    return capture_isp(capture_width, capture_height, requested_focus, focus_mode, settle_sec, timeout_sec);
+  }
+
+  CaptureResult capture_isp(int capture_width, int capture_height, int requested_focus,
+                            const std::string &focus_mode, double settle_sec, double timeout_sec) {
     auto device = std::make_shared<dai::Device>();
     dai::Pipeline pipeline(device);
     auto camera = pipeline.create<dai::node::Camera>()->build(dai::CameraBoardSocket::CAM_A);
@@ -138,11 +171,6 @@ class Oak4FullresCapture : public rclcpp::Node {
       throw std::runtime_error("focus_mode must be 'manual' or 'auto_roi'");
     }
 
-    const int capture_width = static_cast<int>(get_parameter("capture_width").as_int());
-    const int capture_height = static_cast<int>(get_parameter("capture_height").as_int());
-    if (capture_width <= 0 || capture_height <= 0) {
-      throw std::runtime_error("capture_width and capture_height must be positive");
-    }
     dai::Node::Output *camera_output = nullptr;
     if (capture_width >= 8000 && capture_height >= 6000) {
       camera_output = camera->requestFullResolutionOutput(std::nullopt, 1.0F, true);
@@ -188,7 +216,165 @@ class Oak4FullresCapture : public rclcpp::Node {
     auto camera_info = make_camera_info(calibration, image.cols, image.rows);
     pipeline.stop();
     pipeline.wait();
-    return CaptureResult{std::move(image), std::move(camera_info), lens_position};
+    CaptureResult result;
+    result.image = std::move(image);
+    result.camera_info = std::move(camera_info);
+    result.lens_position = lens_position;
+    return result;
+  }
+
+  CaptureResult capture_raw10(int capture_width, int capture_height, int requested_focus,
+                              const std::string &focus_mode, double settle_sec, double timeout_sec) {
+    if (focus_mode != "manual") {
+      throw std::runtime_error(
+          "8K raw10_host capture requires focus_mode=manual; autofocus depends on the crashing ISP path");
+    }
+    const int exposure_us = std::clamp(static_cast<int>(get_parameter("raw_exposure_us").as_int()), 1, 33000);
+    const int iso = std::clamp(static_cast<int>(get_parameter("raw_iso").as_int()), 100, 1600);
+
+    auto device = std::make_shared<dai::Device>();
+    dai::Pipeline pipeline(device);
+    auto camera = pipeline.create<dai::node::Camera>()->build(
+        dai::CameraBoardSocket::CAM_A,
+        std::make_pair(static_cast<std::uint32_t>(capture_width), static_cast<std::uint32_t>(capture_height)),
+        18.0F);
+    camera->initialControl.setManualExposure(static_cast<std::uint32_t>(exposure_us),
+                                             static_cast<std::uint32_t>(iso));
+    camera->initialControl.setManualFocus(static_cast<std::uint8_t>(requested_focus));
+    auto raw_queue = camera->raw.createOutputQueue(2, false);
+
+    pipeline.start();
+    std::this_thread::sleep_for(std::chrono::duration<double>(settle_sec));
+    raw_queue->tryGetAll<dai::ImgFrame>();
+    bool timed_out = false;
+    auto frame = raw_queue->get<dai::ImgFrame>(std::chrono::duration<double>(timeout_sec), timed_out);
+    if (timed_out || frame == nullptr) {
+      pipeline.stop();
+      pipeline.wait();
+      throw std::runtime_error("timed out waiting for 8000x6000 RAW10 frame");
+    }
+    if (frame->getType() != dai::ImgFrame::Type::RAW10) {
+      throw std::runtime_error("camera returned a non-RAW10 frame");
+    }
+
+    const int width = static_cast<int>(frame->getWidth());
+    const int height = static_cast<int>(frame->getHeight());
+    const auto stride = static_cast<std::size_t>(frame->getStride());
+    const auto &data = frame->getData();
+    const auto packed_row_bytes = static_cast<std::size_t>(width / 4) * 5;
+    if (width != capture_width || height != capture_height || width % 4 != 0 ||
+        stride < packed_row_bytes || data.size() < stride * static_cast<std::size_t>(height)) {
+      throw std::runtime_error("invalid RAW10 frame layout");
+    }
+
+    std::array<std::uint64_t, 1024> histogram{};
+    std::array<long double, 4> phase_sum{};
+    std::array<std::uint64_t, 4> phase_count{};
+    for (int y = 0; y < height; ++y) {
+      const auto *row = data.data() + static_cast<std::size_t>(y) * stride;
+      for (int x = 0; x < width; x += 4) {
+        const auto pixels = unpack_raw10(row + static_cast<std::size_t>(x / 4) * 5);
+        for (int offset = 0; offset < 4; ++offset) {
+          const auto value = pixels[static_cast<std::size_t>(offset)];
+          ++histogram[value];
+          const auto phase = static_cast<std::size_t>(((y & 1) << 1) | ((x + offset) & 1));
+          phase_sum[phase] += value;
+          ++phase_count[phase];
+        }
+      }
+    }
+
+    const int black_level = percentile_bin(histogram, get_parameter("raw_black_percentile").as_double());
+    const double red_mean = static_cast<double>(phase_sum[0] / phase_count[0]) - black_level;
+    const double green_mean = 0.5 * (static_cast<double>(phase_sum[1] / phase_count[1]) +
+                                     static_cast<double>(phase_sum[2] / phase_count[2])) - black_level;
+    const double blue_mean = static_cast<double>(phase_sum[3] / phase_count[3]) - black_level;
+    const double red_gain = std::clamp(green_mean / std::max(1.0, red_mean), 0.25, 8.0);
+    const double blue_gain = std::clamp(green_mean / std::max(1.0, blue_mean), 0.25, 8.0);
+
+    cv::Mat bayer16(height, width, CV_16UC1);
+    const double sensor_scale = 65535.0 / std::max(1, 1023 - black_level);
+    for (int y = 0; y < height; ++y) {
+      const auto *row = data.data() + static_cast<std::size_t>(y) * stride;
+      auto *output = bayer16.ptr<std::uint16_t>(y);
+      for (int x = 0; x < width; x += 4) {
+        const auto pixels = unpack_raw10(row + static_cast<std::size_t>(x / 4) * 5);
+        for (int offset = 0; offset < 4; ++offset) {
+          output[x + offset] = static_cast<std::uint16_t>(std::clamp(
+              (static_cast<int>(pixels[static_cast<std::size_t>(offset)]) - black_level) * sensor_scale,
+              0.0, 65535.0));
+        }
+      }
+    }
+
+    cv::Mat color16;
+    cv::cvtColor(bayer16, color16, cv::COLOR_BayerRG2BGR);
+    bayer16.release();
+    const std::array<double, 3> gains = {blue_gain, 1.0, red_gain};
+    std::array<std::uint64_t, 4096> highlight_histogram{};
+    for (int y = 0; y < height; ++y) {
+      const auto *row = color16.ptr<cv::Vec<std::uint16_t, 3>>(y);
+      for (int x = 0; x < width; ++x) {
+        for (int channel = 0; channel < 3; ++channel) {
+          const int value = std::clamp(static_cast<int>(row[x][channel] * gains[channel]), 0, 65535);
+          ++highlight_histogram[static_cast<std::size_t>(value >> 4)];
+        }
+      }
+    }
+    const int highlight = std::max(
+        16, percentile_bin(highlight_histogram, get_parameter("raw_highlight_percentile").as_double()) << 4);
+    const double gamma = std::max(0.1, get_parameter("raw_gamma").as_double());
+    cv::Mat image(height, width, CV_8UC3);
+    for (int y = 0; y < height; ++y) {
+      const auto *input = color16.ptr<cv::Vec<std::uint16_t, 3>>(y);
+      auto *output = image.ptr<cv::Vec3b>(y);
+      for (int x = 0; x < width; ++x) {
+        for (int channel = 0; channel < 3; ++channel) {
+          const double normalized = std::clamp(input[x][channel] * gains[channel] / highlight, 0.0, 1.0);
+          output[x][channel] = static_cast<std::uint8_t>(
+              std::lround(255.0 * std::pow(normalized, 1.0 / gamma)));
+        }
+      }
+    }
+    color16.release();
+
+    auto calibration = device->readCalibration();
+    auto camera_info = make_camera_info(calibration, width, height);
+    pipeline.stop();
+    pipeline.wait();
+    CaptureResult result;
+    result.image = std::move(image);
+    result.camera_info = std::move(camera_info);
+    result.lens_position = requested_focus;
+    result.backend = "raw10_host";
+    result.exposure_us = exposure_us;
+    result.iso = iso;
+    result.black_level = black_level;
+    result.red_gain = red_gain;
+    result.blue_gain = blue_gain;
+    return result;
+  }
+
+  static std::array<std::uint16_t, 4> unpack_raw10(const std::uint8_t *packed) {
+    return {static_cast<std::uint16_t>((packed[0] << 2) | (packed[4] & 0x03)),
+            static_cast<std::uint16_t>((packed[1] << 2) | ((packed[4] >> 2) & 0x03)),
+            static_cast<std::uint16_t>((packed[2] << 2) | ((packed[4] >> 4) & 0x03)),
+            static_cast<std::uint16_t>((packed[3] << 2) | ((packed[4] >> 6) & 0x03))};
+  }
+
+  template <std::size_t Size>
+  static int percentile_bin(const std::array<std::uint64_t, Size> &histogram, double percentile) {
+    const auto total = std::accumulate(histogram.begin(), histogram.end(), std::uint64_t{0});
+    const auto target = static_cast<std::uint64_t>(
+        std::clamp(percentile, 0.0, 100.0) * static_cast<long double>(total) / 100.0L);
+    std::uint64_t cumulative = 0;
+    for (std::size_t index = 0; index < histogram.size(); ++index) {
+      cumulative += histogram[index];
+      if (cumulative >= target) {
+        return static_cast<int>(index);
+      }
+    }
+    return static_cast<int>(Size - 1);
   }
 
   sensor_msgs::msg::CameraInfo make_camera_info(const dai::CalibrationHandler &calibration, int width, int height) {
@@ -230,8 +416,8 @@ class Oak4FullresCapture : public rclcpp::Node {
     }
   }
 
-  static void write_camera_info(const fs::path &path, const sensor_msgs::msg::CameraInfo &info,
-                                int lens_position) {
+  static void write_camera_info(const fs::path &path, const CaptureResult &result) {
+    const auto &info = result.camera_info;
     std::ofstream stream(path);
     if (!stream) {
       throw std::runtime_error("could not write camera info sidecar " + path.string());
@@ -240,7 +426,13 @@ class Oak4FullresCapture : public rclcpp::Node {
     stream << "camera_name: " << info.header.frame_id << "\n";
     stream << "image_width: " << info.width << "\n";
     stream << "image_height: " << info.height << "\n";
-    stream << "lens_position: " << lens_position << "\n";
+    stream << "lens_position: " << result.lens_position << "\n";
+    stream << "capture_backend: " << result.backend << "\n";
+    stream << "exposure_us: " << result.exposure_us << "\n";
+    stream << "iso: " << result.iso << "\n";
+    stream << "raw_black_level: " << result.black_level << "\n";
+    stream << "raw_red_gain: " << result.red_gain << "\n";
+    stream << "raw_blue_gain: " << result.blue_gain << "\n";
     stream << "distortion_model: " << info.distortion_model << "\n";
     stream << "K: [";
     for (std::size_t index = 0; index < info.k.size(); ++index) {

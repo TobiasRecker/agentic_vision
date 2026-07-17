@@ -37,9 +37,10 @@ clip_object_capture_session:
     focus_macro_distance_m: 0.08
     fullres_enabled: true
     fullres_required: true
-    fullres_hardware_enabled: false
+    fullres_hardware_enabled: true
     fullres_camera_node: /oak_fullres_capture
     fullres_capture_service: /oak_fullres_capture/capture
+    fullres_capture_backend: raw10_host
     oak_stop_service: /oak/stop_driver
     oak_start_service: /oak/start_driver
     fullres_width: 8000
@@ -47,7 +48,12 @@ clip_object_capture_session:
     fullres_format: jpg
     fullres_jpeg_quality: 97
     fullres_png_compression: 3
-    fullres_focus_mode: auto_roi
+    fullres_raw_exposure_us: 30000
+    fullres_raw_iso: 800
+    fullres_raw_black_percentile: 0.5
+    fullres_raw_highlight_percentile: 99.7
+    fullres_raw_gamma: 2.2
+    fullres_focus_mode: manual
     fullres_focus_roi_size_px: 800
     roi_default_size_fraction: 0.35
     roi_min_size_px: 24
@@ -66,6 +72,9 @@ clip_object_capture_session:
     allow_2d_center_fallback: true
     fallback_center_depth_m: 0.45
     samples: 18
+    auto_move_settle_sec: 1.0
+    auto_rgbd_settle_sec: 1.0
+    auto_stage_timeout_sec: 20.0
     sphere_radius_m: 0.0
     sphere_polar_span_deg: 50.0
     sphere_spiral_turns: 1.25
